@@ -1,0 +1,19 @@
+# output data
+flii_outputs/
+.tif
+.csv
+.osm.pbf
+.pbf
+.txt
+
+# config files
+.json
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
