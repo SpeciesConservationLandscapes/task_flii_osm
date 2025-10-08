@@ -22,24 +22,81 @@ import csv
 # ------------------------------
 PLANET_PBF_URL = "https://planet.openstreetmap.org/pbf"
 OUTPUT_BASE_DIR = Path("flii_outputs")
-CONFIG_PATH = Path("osm_config_small.json")
+CONFIG_PATH = Path("osm_config.json")
 
-# Make this a .env file.
 # ------------------------------
 # GOOGLE CLOUD / EARTH ENGINE CONFIGURATION
 # ------------------------------
-GCP_PROJECT = ""
-GCS_BUCKET = ""
-SERVICE_ACCOUNT = ""
-SERVICE_KEY_PATH = ""
-EE_ASSET_ROOT = ""
+
+def load_env(filepath=".env"):
+    """Simple parser for .env files."""
+    if not os.path.exists(filepath):
+        print(f"[WARN] .env file not found: {filepath}")
+        return
+
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            # skip comments and empty lines
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            os.environ[key.strip()] = value.strip()
+
+# Load environment variables
+load_env()
+
+# Access them
+GCP_PROJECT = os.getenv("GCP_PROJECT")
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+SERVICE_ACCOUNT = os.getenv("EE_SERVICE_ACCOUNT")
+SERVICE_KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+EE_ASSET_ROOT = os.getenv("EE_ASSET_ROOT")
 
 # ------------------------------
 # UTILITIES
 # ------------------------------
 
+def activate_gcloud_service_account():
+    """Activate GCP service account for gcloud/gsutil commands."""
+    print(f"[GCP AUTH] Activating service account for gcloud: {SERVICE_ACCOUNT}")
+
+    # Look for gcloud executable
+    gcloud_path = shutil.which("gcloud") or shutil.which("gcloud.cmd") or shutil.which("gcloud.CMD")
+
+    if gcloud_path is None:
+        print("[GCP AUTH ERROR] 'gcloud' not found in PATH.")
+        print("Install it from: https://cloud.google.com/sdk/docs/install")
+        return
+
+    try:
+        # Activate service account
+        subprocess.run([
+            gcloud_path,
+            "auth", "activate-service-account", SERVICE_ACCOUNT,
+            "--key-file", SERVICE_KEY_PATH
+        ], check=True)
+
+        # Set the project
+        subprocess.run([
+            gcloud_path,
+            "config", "set", "project", GCP_PROJECT
+        ], check=True)
+
+        # Verify authentication
+        subprocess.run([gcloud_path, "auth", "list"], check=True)
+
+        print("[GCP AUTH] Service account activated and project set successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"[GCP AUTH ERROR] Failed to activate service account: {e}")
+
+
 def init_google_earth_engine():
     """Authenticate and initialize Earth Engine using a service account."""
+    activate_gcloud_service_account()  # 🔹 ensure gsutil & gcloud use the right account
 
     print(f"[AUTH] Authenticating with service account: {SERVICE_ACCOUNT}")
     credentials = service_account.Credentials.from_service_account_file(
@@ -293,29 +350,48 @@ def apply_weights_merge(rasters: List[Path], categories: Dict, merged_path: Path
         except Exception as e:
             print(f"[CLEANUP] Could not remove {tmp}: {e}")
 
+import shutil
+import subprocess
+
 def upload_to_gcs(local_path: Path, gcs_uri: str):
-    """
-    Upload a local raster to Google Cloud Storage using gsutil.
-    Handles Windows shell quirks, and avoids uploading dummy NUL files.
-    """
+    """Upload a local raster to Google Cloud Storage using gsutil."""
     print(f"[UPLOAD] {local_path.name} → {gcs_uri}")
 
-    # Just upload directly — GCS auto-creates the prefix
-    cmd = f'gsutil cp "{str(local_path)}" "{gcs_uri}"'
+    # Find gsutil executable (handle .cmd and .CMD on Windows)
+    gsutil_path = shutil.which("gsutil") or shutil.which("gsutil.cmd") or shutil.which("gsutil.CMD")
 
-    subprocess.run(cmd, shell=(platform.system() == "Windows"), check=True)
-    print("[UPLOAD] Uploaded successfully.")
+    if gsutil_path is None:
+        print("[ERROR] gsutil not found. Make sure Google Cloud SDK is installed and in your PATH.")
+        raise FileNotFoundError("gsutil executable not found.")
+
+    try:
+        cmd = [gsutil_path, "cp", str(local_path), gcs_uri]
+        subprocess.run(cmd, check=True)
+        print("[UPLOAD] Uploaded successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Upload failed for {local_path.name}: {e}")
+        raise
 
 def import_to_earth_engine(asset_id: str, gcs_uri: str):
     """Import a GeoTIFF from GCS to Earth Engine as an asset using the EE CLI."""
-    cmd = (
-        f'earthengine upload image --asset_id="{asset_id}" '
-        f'--pyramiding_policy=MEAN "{gcs_uri}"'
-    )
-
     print(f"[EE IMPORT] {gcs_uri} → {asset_id}")
-    subprocess.run(cmd, shell=(platform.system() == "Windows"), check=True)
-    print("[EE IMPORT] Upload task started.")
+
+    cmd = [
+        "earthengine", "upload", "image",
+        f"--asset_id={asset_id}",
+        "--pyramiding_policy=MEAN",
+        gcs_uri
+    ]
+
+    try:
+        subprocess.run(cmd, check=True)
+        print("[EE IMPORT] Upload task started.")
+    except FileNotFoundError:
+        print("[ERROR] Earth Engine CLI not found. Install via `pip install earthengine-api`.")
+        raise
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Earth Engine import failed: {e}")
+        raise
 
 def export_rasters_to_gee(raster_dir: Path, year: int):
     """
@@ -363,11 +439,11 @@ def export_rasters_to_gee(raster_dir: Path, year: int):
         json.dump(exported_assets, f, indent=2)
 
     gcs_metadata_uri = f"gs://{GCS_BUCKET}/{year}/gee_export_metadata_{year}.json"
-    subprocess.run(
-    f'gsutil cp "{metadata_path}" "{gcs_metadata_uri}"',
-    shell=(platform.system() == "Windows"),
-    check=False
-    )
+    try:
+        subprocess.run(["gsutil", "cp", str(metadata_path), gcs_metadata_uri], check=True)
+        print(f"[METADATA] Export summary uploaded: {gcs_metadata_uri}")
+    except subprocess.CalledProcessError as e:
+        print(f"[WARN] Could not upload metadata to GCS: {e}")
 
     print(f"Export summary saved: {gcs_metadata_uri}")
 
