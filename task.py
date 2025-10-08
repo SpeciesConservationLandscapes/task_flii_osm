@@ -254,7 +254,7 @@ def split_text_to_csv(txt_file, csv_dir, config):
 def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,float,float], res: float) -> List[Path]:
     """
     Rasterize each CSV into a GeoTIFF using gdal_rasterize.
-    Each CSV has columns lon,lat,BURN.
+    Each CSV has columns WKT,BURN.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     rasters = []
@@ -349,9 +349,6 @@ def apply_weights_merge(rasters: List[Path], categories: Dict, merged_path: Path
             print(f"[CLEANUP] Removed {tmp}")
         except Exception as e:
             print(f"[CLEANUP] Could not remove {tmp}: {e}")
-
-import shutil
-import subprocess
 
 def upload_to_gcs(local_path: Path, gcs_uri: str):
     """Upload a local raster to Google Cloud Storage using gsutil."""
