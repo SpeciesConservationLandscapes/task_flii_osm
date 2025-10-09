@@ -6,10 +6,7 @@ flii_outputs/
 .pbf
 .txt
 
-# config files
-.json
-
-# Environments
+# env
 .env
 .venv
 env/
@@ -17,3 +14,5 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+.vscode/

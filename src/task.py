@@ -15,41 +15,23 @@ from google.oauth2 import service_account
 import re
 from collections import defaultdict
 import csv
-
+import tempfile
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_BASE_DIR = PROJECT_ROOT / "flii_outputs"
+CONFIG_PATH = PROJECT_ROOT / "src" / "osm_config.json"
 PLANET_PBF_URL = "https://planet.openstreetmap.org/pbf"
-OUTPUT_BASE_DIR = Path("flii_outputs")
-CONFIG_PATH = Path("osm_config.json")
 
 # ------------------------------
 # GOOGLE CLOUD / EARTH ENGINE CONFIGURATION
 # ------------------------------
 
-def load_env(filepath=".env"):
-    """Simple parser for .env files."""
-    if not os.path.exists(filepath):
-        print(f"[WARN] .env file not found: {filepath}")
-        return
-
-    with open(filepath, "r") as f:
-        for line in f:
-            line = line.strip()
-            # skip comments and empty lines
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-
-            key, value = line.split("=", 1)
-            os.environ[key.strip()] = value.strip()
-
-# Load environment variables
-load_env()
-
-# Access them
 GCP_PROJECT = os.getenv("GCP_PROJECT")
 GCS_BUCKET = os.getenv("GCS_BUCKET")
 SERVICE_ACCOUNT = os.getenv("EE_SERVICE_ACCOUNT")
@@ -64,7 +46,6 @@ def activate_gcloud_service_account():
     """Activate GCP service account for gcloud/gsutil commands."""
     print(f"[GCP AUTH] Activating service account for gcloud: {SERVICE_ACCOUNT}")
 
-    # Look for gcloud executable
     gcloud_path = shutil.which("gcloud") or shutil.which("gcloud.cmd") or shutil.which("gcloud.CMD")
 
     if gcloud_path is None:
@@ -72,12 +53,26 @@ def activate_gcloud_service_account():
         print("Install it from: https://cloud.google.com/sdk/docs/install")
         return
 
+    key_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not key_env:
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set in the environment.")
+
+    # Handle both inline JSON and file path
+    if key_env.strip().startswith("{"):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            tmp.write(key_env)
+            tmp_path = tmp.name
+        key_file = tmp_path
+        print(f"[GCP AUTH] Wrote inlined service account JSON to temporary file: {key_file}")
+    else:
+        key_file = key_env
+
     try:
         # Activate service account
         subprocess.run([
             gcloud_path,
             "auth", "activate-service-account", SERVICE_ACCOUNT,
-            "--key-file", SERVICE_KEY_PATH
+            "--key-file", key_file
         ], check=True)
 
         # Set the project
@@ -92,16 +87,36 @@ def activate_gcloud_service_account():
         print("[GCP AUTH] Service account activated and project set successfully.")
     except subprocess.CalledProcessError as e:
         print(f"[GCP AUTH ERROR] Failed to activate service account: {e}")
+    finally:
+        # Clean up temporary file if created
+        if key_env.strip().startswith("{") and os.path.exists(key_file):
+            os.remove(key_file)
+            print(f"[GCP AUTH] Removed temporary key file: {key_file}")
 
 
 def init_google_earth_engine():
     """Authenticate and initialize Earth Engine using a service account."""
-    activate_gcloud_service_account()  # 🔹 ensure gsutil & gcloud use the right account
+    activate_gcloud_service_account()  # ensure gsutil & gcloud use the right account
 
     print(f"[AUTH] Authenticating with service account: {SERVICE_ACCOUNT}")
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_KEY_PATH, scopes=["https://www.googleapis.com/auth/earthengine"]
-    )
+    if SERVICE_KEY_PATH is None:
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set in the environment.")
+
+    # Detect whether it's a JSON string or a file path
+    if SERVICE_KEY_PATH.strip().startswith("{"):
+        # JSON string or dict passed directly
+        print("[AUTH] Using inlined service account JSON.")
+        key_info = json.loads(SERVICE_KEY_PATH)
+        credentials = service_account.Credentials.from_service_account_info(
+            key_info, scopes=["https://www.googleapis.com/auth/earthengine"]
+        )
+    else:
+        # File path passed
+        print(f"[AUTH] Using service account file: {SERVICE_KEY_PATH}")
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_KEY_PATH, scopes=["https://www.googleapis.com/auth/earthengine"]
+        )
+
     ee.Initialize(credentials, project=GCP_PROJECT)
     print(f"[AUTH] Earth Engine initialized for project: {GCP_PROJECT}")
 
@@ -281,41 +296,52 @@ def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,flo
 
     return rasters
 
-def run_gdal_calc(rasters: List[Path], categories: Dict, out_path: Path):
+def run_gdal_calc(rasters: List[Path], categories: Dict, out_path: Path, weighted: bool = True):
+    """
+    Combine multiple rasters into one using gdal_calc.py.
+    If weighted=True, apply category weights.
+    If weighted=False, simply sum rasters.
+    """
+    if not rasters:
+        raise ValueError("No rasters provided to run_gdal_calc")
+
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if len(rasters) > len(letters):
+        raise ValueError(f"Too many rasters for one gdal_calc call ({len(rasters)} > 26)")
+
     args = [
-        sys.executable, "-m", "osgeo_utils.gdal_calc",
+        "gdal_calc.py",
         "--overwrite",
         "--outfile", str(out_path),
         "--co=COMPRESS=LZW",
-        "--type=Int16"   # evitar overflow
+        "--type=Int16"
     ]
 
     expr_terms = []
     for i, raster in enumerate(rasters):
-        if i >= len(letters):
-            raise ValueError("Too many rasters for one gdal_calc call (max 26)")
-        letter = letters[i]        # maiúscula
+        letter = letters[i]
         args.append(f"-{letter}")
         args.append(str(raster))
 
         weight = 1
-        for tagval, w in categories.items():
-            tag_safe = tagval.replace(":", "_").replace("/", "_")
-            if tag_safe in raster.name:
-                weight = w
-                break
-
+        if weighted:
+            for tagval, w in categories.items():
+                tag_safe = tagval.replace(":", "_").replace("/", "_")
+                if tag_safe in raster.name:
+                    weight = w
+                    break
         expr_terms.append(f"{weight}*{letter}")
 
     args.append(f"--calc={' + '.join(expr_terms)}")
-    print("[DEBUG] gdal_calc expression:", args[-1])   # debug útil
+    print(f"[DEBUG] gdal_calc expression: {args[-1]}")
     subprocess.run(args, check=True)
 
 def apply_weights_merge(rasters: List[Path], categories: Dict, merged_path: Path):
     """
-    Merge rasters with weights applied, handling >26 rasters by chunking.
-    Cleans up intermediate files after the final merge.
+    Merge rasters with weights applied, handling >26 rasters by chunking and parallelizing.
+    - Weighted merges for first-level chunks
+    - Simple sum for higher-level merges
+    - Automatically recurses if >26 intermediates
     """
     if not rasters:
         print("No rasters to merge.")
@@ -323,26 +349,47 @@ def apply_weights_merge(rasters: List[Path], categories: Dict, merged_path: Path
 
     print(f"[MERGE] Found {len(rasters)} rasters...")
 
-    # Case 1: small number of rasters
+    # Helper for chunk merging
+    def merge_chunk(i, chunk):
+        tmp_out = merged_path.parent / f"merge_part{i+1}.tif"
+        print(f"[CHUNK {i+1}] Merging {len(chunk)} rasters → {tmp_out}")
+        run_gdal_calc(chunk, categories, tmp_out, weighted=True)
+        return tmp_out
+
+    # Base case: 26 or fewer rasters
     if len(rasters) <= 26:
-        run_gdal_calc(rasters, categories, merged_path)
-        print(f"Done. Final merged raster: {merged_path}")
+        run_gdal_calc(rasters, categories, merged_path, weighted=True)
+        print(f"Final merged raster: {merged_path}")
         return
 
-    # Case 2: too many rasters → chunk into groups
+    # Chunking setup
+    chunk_size = 20
+    chunks = [rasters[i:i+chunk_size] for i in range(0, len(rasters), chunk_size)]
     temp_files = []
-    chunk_size = 20  # safe margin under 26
-    for i in range(0, len(rasters), chunk_size):
-        chunk = rasters[i:i+chunk_size]
-        tmp_out = merged_path.parent / f"merge_part{i//chunk_size+1}.tif"
-        run_gdal_calc(chunk, categories, tmp_out)
-        temp_files.append(tmp_out)
 
-    # Final merge from intermediate results
-    run_gdal_calc(temp_files, categories, merged_path)
-    print(f"Done. Final merged raster: {merged_path}")
+    # Run merges in parallel (I/O-bound → threads are fine)
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
+        futures = {executor.submit(merge_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+        for future in as_completed(futures):
+            try:
+                temp_files.append(future.result())
+            except Exception as e:
+                print(f"[ERROR] Chunk {futures[future]+1} failed: {e}")
 
-    # Cleanup intermediate files
+    print(f"[MERGE] {len(temp_files)} intermediate rasters created.")
+
+    # If the intermediate rasters still exceed 26, recurse
+    if len(temp_files) > 26:
+        print("[MERGE] Too many intermediates, merging recursively...")
+        apply_weights_merge(temp_files, categories, merged_path)
+        return
+
+    # Final simple merge (unweighted)
+    print("[MERGE] Combining intermediate rasters (unweighted)...")
+    run_gdal_calc(temp_files, categories, merged_path, weighted=False)
+    print(f"✅ Done. Final merged raster: {merged_path}")
+
+    # Cleanup
     for tmp in temp_files:
         try:
             os.remove(tmp)
@@ -369,25 +416,53 @@ def upload_to_gcs(local_path: Path, gcs_uri: str):
         print(f"[ERROR] Upload failed for {local_path.name}: {e}")
         raise
 
+def ensure_ee_folder_exists(folder_path: str):
+    """
+    Ensure that an Earth Engine asset folder exists.
+    If it doesn't, create it recursively.
+    """
+    try:
+        ee.data.getAsset(folder_path)
+        print(f"[EE FOLDER] Exists: {folder_path}")
+    except ee.ee_exception.EEException:
+        parent = "/".join(folder_path.split("/")[:-1])
+        if parent and not parent.startswith("projects/"):
+            parent = f"projects/{GCP_PROJECT}/assets/{parent}"
+        # Recursively ensure parent exists first
+        if parent and parent != folder_path:
+            ensure_ee_folder_exists(parent)
+        print(f"[EE FOLDER] Creating: {folder_path}")
+        ee.data.createAsset({'type': 'Folder'}, folder_path)
+
 def import_to_earth_engine(asset_id: str, gcs_uri: str):
-    """Import a GeoTIFF from GCS to Earth Engine as an asset using the EE CLI."""
+    """Import a GeoTIFF from GCS to Earth Engine using the Python API (service account safe)."""
     print(f"[EE IMPORT] {gcs_uri} → {asset_id}")
 
-    cmd = [
-        "earthengine", "upload", "image",
-        f"--asset_id={asset_id}",
-        "--pyramiding_policy=MEAN",
-        gcs_uri
-    ]
-
     try:
-        subprocess.run(cmd, check=True)
-        print("[EE IMPORT] Upload task started.")
-    except FileNotFoundError:
-        print("[ERROR] Earth Engine CLI not found. Install via `pip install earthengine-api`.")
-        raise
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Earth Engine import failed: {e}")
+        # Ensure parent folder exists
+        folder_path = "/".join(asset_id.split("/")[:-1])
+        ensure_ee_folder_exists(folder_path)
+
+        # Check if asset already exists
+        try:
+            ee.data.getAsset(asset_id)
+            print(f"[EE IMPORT] Asset already exists: {asset_id} — skipping upload.")
+            return
+        except ee.ee_exception.EEException:
+            pass
+
+        params = {
+            'id': asset_id,
+            'tilesets': [{'sources': [{'uris': [gcs_uri]}]}],
+            'bands': [{'id': 'b1'}],
+            'pyramidingPolicy': 'MEAN'
+        }
+
+        task = ee.data.startIngestion(str(uuid.uuid4()), params)
+        print(f"[EE IMPORT] Ingestion task started: {task['id']}")
+
+    except Exception as e:
+        print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
         raise
 
 def export_rasters_to_gee(raster_dir: Path, year: int):
@@ -396,22 +471,32 @@ def export_rasters_to_gee(raster_dir: Path, year: int):
     and import them to Earth Engine.
     """
     print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
+
+    # Collect both per-feature rasters and the final merged one
     tifs = list(raster_dir.glob("*.tif"))
+
+    # Also include the final merged raster at year_dir level if it exists
+    merged_candidate = raster_dir.parent / f"flii_infra_{year}.tif"
+    if merged_candidate.exists():
+        tifs.append(merged_candidate)
+        print(f"[EXPORT] Including merged raster: {merged_candidate.name}")
+
     if not tifs:
-        print("No rasters found to export.")
+        print("[EXPORT] No rasters found to export.")
         return
 
     exported_assets = []
 
     for tif in tifs:
+        # Normalize name and remote paths
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
         asset_id = f"{EE_ASSET_ROOT}/{year}/{tif.stem}"
 
         try:
-            # 1. Upload to bucket
+            # Upload to Cloud Storage
             upload_to_gcs(tif, gcs_uri)
 
-            # 2. Import to Earth Engine
+            # Import to Earth Engine
             import_to_earth_engine(asset_id, gcs_uri)
 
             exported_assets.append({
@@ -430,7 +515,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int):
                 "status": f"failed - {e}"
             })
 
-    # Save summary metadata locally and to GCS
+    # Save summary metadata locally and upload to GCS
     metadata_path = raster_dir / f"gee_export_metadata_{year}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(exported_assets, f, indent=2)
@@ -443,6 +528,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int):
         print(f"[WARN] Could not upload metadata to GCS: {e}")
 
     print(f"Export summary saved: {gcs_metadata_uri}")
+
 
 
 # ------------------------------
@@ -465,7 +551,7 @@ def main():
     txt_file = year_dir / f"osm_{year}.txt"
     csv_dir = year_dir / "csvs"
     raster_dir = year_dir / "rasters"
-    merged_path = year_dir / f"flii_osm_{year}_merged.tif"
+    merged_path = year_dir / f"flii_infra_{year}.tif"
     pbf_path = year_dir / f"osm_{year}.osm.pbf"
 
     for d in [csv_dir, raster_dir]:

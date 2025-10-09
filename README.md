@@ -41,22 +41,38 @@ This script fetches, processes, rasterizes, and exports OSM features into multib
 ## Environment Variables
 
 All credentials and project configuration are loaded from a `.env` file.  
-You can copy and edit the provided template:
+Refer to [`.env.example`](/.env.example) to setup your env locally.
 
-## Output Structure
+## Structure
 
-flii_outputs/
+```text
+FLII_OSM/
 │
-├── 2021/
-├── 2022/
-├── 2023/
-└── 2024/
-    ├── csvs/
-    ├── rasters/
-    ├── flii_osm_2024_merged.tif
-    ├── osm_2024.osm.pbf
-    ├── osm_2024.txt
-    └── gee_export_metadata_2024.json
+├── src/
+│     ├── task.py
+│     └── osm_config.json
+│
+├── flii_outputs/
+│     ├── <years>
+│     ├── 2021/
+│     ├── 2022/
+│     ├── 2023/
+│     ├── 2024/
+│     │     ├── csvs/
+│     │     ├── <category=subcategory>.csv
+│     ├── rasters/
+│     │     ├── gee_export_metadata_2024.json
+│     │     ├── <category_subcategory>.tiff
+│     ├── flii_osm_2024_merged.tif
+│     ├── osm_2024.osm.pbf
+│     └── osm_2024.txt
+├── .env
+├── Dockerfile
+├── Makefile
+└── README.md
+```
 
-
-
+## License
+Copyright (C) 2025 Wildlife Conservation Society
+The files in this repository are part of the task framework for calculating 
+the Forest Landscape Integrity Index [(https://www.forestintegrity.com/)](https://www.forestintegrity.com/) and are released under the GPL license: [https://www.gnu.org/licenses/#GPL](https://www.gnu.org/licenses/#GPL). See [LICENSE](./LICENSE) for details.
