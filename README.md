@@ -18,7 +18,7 @@ This script fetches, processes, rasterizes, and exports OSM features into GeoTIF
    Uses `osmium` to convert the OSM file (`.pbf`, `.bz2`) into a `.txt` format.
 
 3. **Split text into filtered CSVs**  
-   - Extracts points matching the OSM tags and subcategories defined in [`osm_config.json`](osm_config.json).  
+   - Extracts features (e.g. lines, points) matching the OSM tags and subcategories defined in [`osm_config.json`](osm_config.json).  
    - Writes one CSV per tag-value combination (e.g., `highway=footway.csv`).
 
 4. **Rasterize each CSV file**  
