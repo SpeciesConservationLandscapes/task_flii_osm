@@ -23,28 +23,28 @@ import math
 from tqdm import tqdm
 import itertools
 
-# ------------------------------
-# GDAL CONFIG (large-job tuning)
-# ------------------------------
+# ------------
+# GDAL CONFIG 
+# ------------
 gdal.UseExceptions()
-gdal.SetConfigOption("GDAL_CACHEMAX", "512")              # MB, tweak per VM
+gdal.SetConfigOption("GDAL_CACHEMAX", "512")
 gdal.SetConfigOption("GDAL_SWATH_SIZE", "512")
 gdal.SetConfigOption("GDAL_MAX_DATASET_POOL_SIZE", "400")
 os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
 os.environ["NUMEXPR_MAX_THREADS"] = str(os.cpu_count())
 
-# ------------------------------
-# CONFIGURATION
-# ------------------------------
+# ----------------------
+# DIRECTORY / OSM CONFIG
+# ----------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_BASE_DIR = PROJECT_ROOT / "flii_outputs"
 CONFIG_PATH = PROJECT_ROOT / "src" / "osm_config.json"
 PLANET_PBF_URL = "https://planet.openstreetmap.org/pbf"
 
-# ------------------------------
-# GOOGLE CLOUD / EARTH ENGINE CONFIGURATION
-# ------------------------------
+# ----------------------------------
+# GOOGLE CLOUD / EARTH ENGINE CONFIG
+# ----------------------------------
 
 GCP_PROJECT = os.getenv("GCP_PROJECT")
 GCS_BUCKET = os.getenv("GCS_BUCKET")
@@ -58,6 +58,11 @@ EE_ASSET_ROOT = os.getenv("EE_ASSET_ROOT")
 
 @contextmanager
 def log_time(label: str):
+    """
+    Measures how long a code block takes to run.
+    It prints the elapsed time when the block ends.
+    Used in the 'main' function.
+    """
     start = time.time()
     print(f"[TIMER] Starting: {label}")
     try:
@@ -67,14 +72,19 @@ def log_time(label: str):
         print(f"[TIMER] Finished {label} — {elapsed/60:.2f} min ({elapsed:.1f} sec)")
 
 def activate_gcloud_service_account():
+    """
+    Activates the gcloud service account using the provided key file or inlined JSON. 
+    """
     print(f"[GCP AUTH] Activating service account for gcloud: {SERVICE_ACCOUNT}")
 
+    # Find gcloud in PATH.
     gcloud_path = shutil.which("gcloud") or shutil.which("gcloud.cmd") or shutil.which("gcloud.CMD")
     if gcloud_path is None:
         print("[GCP AUTH ERROR] 'gcloud' not found in PATH.")
         print("Install it from: https://cloud.google.com/sdk/docs/install")
         return
-
+    
+    # Get credentials from environment variable.
     key_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if not key_env:
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set in the environment.")
@@ -88,6 +98,7 @@ def activate_gcloud_service_account():
     else:
         key_file = key_env
 
+    # Authenticate service account and set cloud project.
     try:
         subprocess.run([gcloud_path, "auth", "activate-service-account", SERVICE_ACCOUNT, "--key-file", key_file], check=True)
         subprocess.run([gcloud_path, "config", "set", "project", GCP_PROJECT], check=True)
@@ -101,6 +112,11 @@ def activate_gcloud_service_account():
             print(f"[GCP AUTH] Removed temporary key file: {key_file}")
 
 def init_google_earth_engine():
+    """
+    Authenticates with Google Earth Engine using the same service account.
+    Initializes the Earth Engine API.
+    Sets cloud project.
+    """
     activate_gcloud_service_account()
     print(f"[AUTH] Authenticating with service account: {SERVICE_ACCOUNT}")
     if SERVICE_KEY_PATH is None:
@@ -122,12 +138,19 @@ def init_google_earth_engine():
     print(f"[AUTH] Earth Engine initialized for project: {GCP_PROJECT}")
 
 def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]:
+    """
+    Finds the closest OSM file (.pbf or .bz2) for the given year, checking up to max_age_days before Dec 31.
+    It checks multiple known mirror URLs.
+    """
     import requests
     from datetime import datetime, timedelta
 
     taskdate = datetime(task_year, 12, 31)
 
     def _try_osm_urls(urlbase: str, maxage: int) -> Optional[Tuple[str, str]]:
+        """
+        Checks the given URL base for the OSM file, trying dates from 'taskdate' back to 'taskdate - maxage days'.
+        """
         for days_back in range(maxage + 1):
             check_date = taskdate - timedelta(days=days_back)
             params = {
@@ -155,11 +178,13 @@ def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]
     faude_pbf = "https://ftp.fau.de/osm-planet/pbf/planet-{planetdate}.osm.pbf"
     planet_osm_archive = "https://planet.openstreetmap.org/planet/{year}/planet-{planetdate}.osm.bz2"
 
+    # Try Faude.de for 2020+ (more frequent updates).
     if task_year >= 2020:
         result = _try_osm_urls(faude_pbf, maxage=6)
         if result:
             return result
 
+    # Try Planet OSM archive for older years.
     result = _try_osm_urls(planet_osm_archive, maxage=max_age_days)
     if result:
         return result
@@ -171,6 +196,11 @@ def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]
     )
 
 def download_pbf(year: int, dest_path: Path) -> Path:
+    """
+    Downloads the OSM file (.pbf or .bz2) for the specified year to dest_path.
+    Supports resuming partial downloads if the server allows it.
+    Stores metadata (size, URL, date) about the download in a JSON file alongside the data.
+    """
     metadata_path = dest_path.parent / "osm_download_metadata.json"
     url, found_date = _find_osm_pbf_url(year)
     print(f"[DOWNLOAD] Preparing to fetch {url}")
@@ -248,7 +278,7 @@ def download_pbf(year: int, dest_path: Path) -> Path:
 def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
     """
     Convert an OSM PBF/BZ2 file directly to text using osmium export.
-    Optimized for global runs — filters by relevant keys only, no intermediate PBF.
+    Optimized for global runs: filters by relevant keys only, no intermediate PBF.
     Compatible with Osmium versions that expect JSON configs.
     """
     if not osm_path.exists():
@@ -257,10 +287,10 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
     txt_dir.mkdir(parents=True, exist_ok=True)
     out_path = txt_dir / f"{osm_path.stem}.txt"
 
-    # Extract unique OSM keys from config (e.g., highway, railway, man_made)
+    # Extract unique OSM keys from config (e.g., highway, railway, man_made).
     keys = sorted({k.split("=")[0] for k in config.keys()})
 
-    # Build JSON configuration
+    # Build JSON configuration.
     cfg = {"filters": [{"key": k} for k in keys]}
     cfg_path = txt_dir / "osmium_keys.json"
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -270,12 +300,11 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
     print(f"[OSMIUM] Generated JSON filter config for {len(keys)} keys:")
     print(", ".join(keys[:10]) + ("..." if len(keys) > 10 else ""))
 
-    # Build export command (no --strategy for compatibility)
     cmd = [
         "osmium", "export",
         "--overwrite",
-        "--omit-rs",          # omit relation skeletons
-        "-c", str(cfg_path),  # JSON config file
+        "--omit-rs",          # omit relation skeletons for speed.
+        "-c", str(cfg_path),  # JSON config file.
         "-f", "text",
         "-o", str(out_path),
         str(osm_path)
@@ -296,13 +325,15 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
 
     return out_path
 
-# ----------------
-# STREAMING SPLIT 
-# ----------------
 def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, Path], config: Dict, max_rows:int = 1_000_000) -> List[Path]:
     """
     Stream the OSM text and write per-tag CSVs in shards up to max_rows each.
-    CSV schema: WKT,BURN (BURN = per-tag weight from config)
+    For each text line (geometry + tags):
+    - Extracts matching tags from the osm_config.json
+    - Writes each tag's features to its own CSV shard 
+    Each CSV has columns: "WKT" (geometry) and "BURN" (the tag's numeric weight).
+    This allows flexible per-tag rasterization later.
+    Shards are named like highway_residential_001.csv, highway_residential_002.csv, etc.
     """
     os.makedirs(csv_dir, exist_ok=True)
     target_tags = set(config.keys())  # e.g., {"highway=primary": 9, ...}
@@ -349,7 +380,7 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
                         tag_row_counts[tag_val] = 0
                         out_paths.append(out_path)
 
-                    # 🔑 bake the weight here
+                    # Bake the weight here.
                     burn = int(config[tag_val])
                     tag_files[tag_val].writerow([wkt, burn])
                     tag_row_counts[tag_val] += 1
@@ -363,16 +394,11 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     print(f"[SPLIT] {txt_file} → {len(out_paths)} CSV shards")
     return out_paths
 
-# ------------------------------
-# PARALLEL RASTERIZATION (GDAL API)
-# ------------------------------
 def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
                       bounds: Tuple[float,float,float,float], res: float):
     """
     Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Int16 GeoTIFF.
     """
-    # GDAL can read CSV with WKT using -oo options via CLI; here we use Rasterize with layer creation via VRT trick.
-    # Simpler approach: call gdal.Rasterize directly on CSV (OGR handles WKT if header is WKT).
     opts = gdal.RasterizeOptions(
         format="GTiff",
         outputType=gdalconst.GDT_Int16,
@@ -398,6 +424,10 @@ def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
     return Path(out_tif)
 
 def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,float,float], res: float) -> List[Path]:
+    """
+    Run _rasterize_single in parallel for all CSVs using ProcessPoolExecutor.
+    Produce one GeoTIFF per CSV shard in out_dir.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     out_tifs = [out_dir / (Path(c).stem + ".tif") for c in csvs]
     num_cpus = max(1, (os.cpu_count() or 2) - 1)
@@ -407,11 +437,6 @@ def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,flo
         list(exe.map(_rasterize_single, csvs, out_tifs, itertools.repeat(bounds), itertools.repeat(res)))
 
     return out_tifs
-
-# ---------------
-# WEIGHTED MERGE 
-# ---------------
-
 
 def merge_tag_shards(raster_dir: Path) -> List[Path]:
     """
@@ -452,10 +477,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
-    Sum ≤26 rasters safely (A+B+...), treating NoData as 0.
+    Sum ≤26 (limit) rasters safely (A+B+...), treating NoData as 0.
     Unsets NoData on all inputs and output to avoid propagation.
     """
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" # 26.
     if len(inputs) == 0:
         raise ValueError("No rasters provided to _calc_sum")
     if len(inputs) > 26:
@@ -482,8 +507,9 @@ def _calc_sum(inputs: List[Path], out_path: Path):
 
 def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
     """
-    Sum any number of rasters safely by merging in chunks (≤26 per gdal_calc call).
-    Each round merges chunks in parallel for speed.
+    Handles cases with more than 26 rasters by merging them in chunks in parallel.
+    Runs several _calc_sum() calls concurrently and merges intermediate results
+    until one final raster remains.
     """
     if len(inputs) == 0:
         raise ValueError("No rasters provided to _calc_sum_safe")
@@ -537,7 +563,7 @@ def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
 
 def sum_all_rasters(inputs: List[Path], out_path: Path):
     """
-    Wrapper for safe, multi-threaded summation of any number of rasters.
+    Wrapper that merges all tag-level rasters into the final infrastructure raster.
     """
     if not inputs:
         print("[MERGE] No rasters to sum.")
@@ -545,10 +571,10 @@ def sum_all_rasters(inputs: List[Path], out_path: Path):
     print(f"[MERGE] Summing {len(inputs)} rasters into {out_path.name} (multi-threaded) ...")
     _calc_sum_safe(inputs, out_path)
 
-# ------------------------------
-# GCS / GEE EXPORT (unchanged)
-# ------------------------------
 def upload_to_gcs(local_path: Path, gcs_uri: str):
+    """
+    Uses the 'gsutil' CLI to copy rasters to a GCS bucket.
+    """
     print(f"[UPLOAD] {local_path.name} → {gcs_uri}")
     gsutil_path = shutil.which("gsutil") or shutil.which("gsutil.cmd") or shutil.which("gsutil.CMD")
     if gsutil_path is None:
@@ -562,6 +588,9 @@ def upload_to_gcs(local_path: Path, gcs_uri: str):
         raise
 
 def ensure_ee_folder_exists(folder_path: str):
+    """
+    Ensure a GEE folder exists before uploading assets into it.
+    """
     try:
         ee.data.getAsset(folder_path)
         print(f"[EE FOLDER] Exists: {folder_path}")
@@ -575,6 +604,11 @@ def ensure_ee_folder_exists(folder_path: str):
         ee.data.createAsset({'type': 'Folder'}, folder_path)
 
 def import_to_earth_engine(asset_id: str, gcs_uri: str):
+    """
+    Given a GCS URI and desired asset ID, tell Earth Engine
+    to ingest the raster as an asset.
+    Uses the GEE REST ingestion API (ee.data.startIngestion).
+    """
     print(f"[EE IMPORT] {gcs_uri} → {asset_id}")
     try:
         folder_path = "/".join(asset_id.split("/")[:-1])
@@ -599,6 +633,11 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
         raise
 
 def export_rasters_to_gee(raster_dir: Path, year: int, upload_merged_only: bool = False):
+    """
+    If upload_merged_only=True, uploads only the merged final raster (infrastucture layer).
+    Otherwise, uploads all per-tag rasters plus the merged one.
+    Each uploaded raster is registered as a new GEE asset.
+    """
     print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
 
     if upload_merged_only:
@@ -656,19 +695,22 @@ def export_rasters_to_gee(raster_dir: Path, year: int, upload_merged_only: bool 
 
     print(f"Export summary saved: {gcs_metadata_uri}")
 
-# ------------------------------
-# CLEANUP
-# ------------------------------
 def cleanup_intermediates(year_dir: Path):
+    """
+    After a successful run, this removes large intermediate files (CSV shards,
+    temporary merge rasters, etc.) to save disk space.
+    """
     print(f"[CLEANUP] Removing intermediates in {year_dir}")
     for sub in ["csvs", "rasters/_tmp_merge"]:
         p = year_dir / sub
         shutil.rmtree(p, ignore_errors=True)
 
-# ------------------------------
-# MAIN LOGIC (optimized pipeline)
-# ------------------------------
 def main():
+    """
+    Execute all stages.
+    """
+
+    # Parse command-line arguments.
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=date.today().year)
     parser.add_argument("--resolution", type=float, default=0.00269)
@@ -686,6 +728,7 @@ def main():
     do_cleanup = args.cleanup
     upload_merged_only = args.upload_merged_only
 
+    # Define paths and names.
     year_dir = OUTPUT_BASE_DIR / f"{year}"
     txt_dir = year_dir
     csv_dir = year_dir / "csvs"
@@ -700,6 +743,7 @@ def main():
         config = json.load(f)
     categories = config.get("osm_categories", {}).get("weights", {})
 
+    # Run all steps with timing logs.
     with log_time("[1] Download OSM PBF"):
         if not pbf_path.exists() and not any(year_dir.glob("osm_*.osm.bz2")):
             download_pbf(year, pbf_path)
@@ -736,7 +780,7 @@ def main():
         init_google_earth_engine()
         export_rasters_to_gee(raster_dir, year, upload_merged_only)
 
-
+    # Optionally clean up intermediates.
     if do_cleanup:
         with log_time("[7] Cleanup intermediates"):
             cleanup_intermediates(year_dir)
@@ -747,4 +791,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[FATAL] Pipeline failed: {e}")
         sys.exit(1)
-
