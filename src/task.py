@@ -6,10 +6,9 @@ import subprocess
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
-from osgeo import gdal
+from typing import Dict, List, Tuple, Optional, Union
+from osgeo import gdal, gdalconst
 import requests
-import platform
 import ee
 from google.oauth2 import service_account
 import re
@@ -17,7 +16,22 @@ from collections import defaultdict
 import csv
 import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import time
+from contextlib import contextmanager
+import math
+from tqdm import tqdm
+import itertools
+
+# ------------------------------
+# GDAL CONFIG (large-job tuning)
+# ------------------------------
+gdal.UseExceptions()
+gdal.SetConfigOption("GDAL_CACHEMAX", "512")              # MB, tweak per VM
+gdal.SetConfigOption("GDAL_SWATH_SIZE", "512")
+gdal.SetConfigOption("GDAL_MAX_DATASET_POOL_SIZE", "400")
+os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
+os.environ["NUMEXPR_MAX_THREADS"] = str(os.cpu_count())
 
 # ------------------------------
 # CONFIGURATION
@@ -42,12 +56,20 @@ EE_ASSET_ROOT = os.getenv("EE_ASSET_ROOT")
 # UTILITIES
 # ------------------------------
 
+@contextmanager
+def log_time(label: str):
+    start = time.time()
+    print(f"[TIMER] Starting: {label}")
+    try:
+        yield
+    finally:
+        elapsed = time.time() - start
+        print(f"[TIMER] Finished {label} — {elapsed/60:.2f} min ({elapsed:.1f} sec)")
+
 def activate_gcloud_service_account():
-    """Activate GCP service account for gcloud/gsutil commands."""
     print(f"[GCP AUTH] Activating service account for gcloud: {SERVICE_ACCOUNT}")
 
     gcloud_path = shutil.which("gcloud") or shutil.which("gcloud.cmd") or shutil.which("gcloud.CMD")
-
     if gcloud_path is None:
         print("[GCP AUTH ERROR] 'gcloud' not found in PATH.")
         print("Install it from: https://cloud.google.com/sdk/docs/install")
@@ -57,7 +79,6 @@ def activate_gcloud_service_account():
     if not key_env:
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set in the environment.")
 
-    # Handle both inline JSON and file path
     if key_env.strip().startswith("{"):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
             tmp.write(key_env)
@@ -68,50 +89,30 @@ def activate_gcloud_service_account():
         key_file = key_env
 
     try:
-        # Activate service account
-        subprocess.run([
-            gcloud_path,
-            "auth", "activate-service-account", SERVICE_ACCOUNT,
-            "--key-file", key_file
-        ], check=True)
-
-        # Set the project
-        subprocess.run([
-            gcloud_path,
-            "config", "set", "project", GCP_PROJECT
-        ], check=True)
-
-        # Verify authentication
+        subprocess.run([gcloud_path, "auth", "activate-service-account", SERVICE_ACCOUNT, "--key-file", key_file], check=True)
+        subprocess.run([gcloud_path, "config", "set", "project", GCP_PROJECT], check=True)
         subprocess.run([gcloud_path, "auth", "list"], check=True)
-
         print("[GCP AUTH] Service account activated and project set successfully.")
     except subprocess.CalledProcessError as e:
         print(f"[GCP AUTH ERROR] Failed to activate service account: {e}")
     finally:
-        # Clean up temporary file if created
         if key_env.strip().startswith("{") and os.path.exists(key_file):
             os.remove(key_file)
             print(f"[GCP AUTH] Removed temporary key file: {key_file}")
 
-
 def init_google_earth_engine():
-    """Authenticate and initialize Earth Engine using a service account."""
-    activate_gcloud_service_account()  # ensure gsutil & gcloud use the right account
-
+    activate_gcloud_service_account()
     print(f"[AUTH] Authenticating with service account: {SERVICE_ACCOUNT}")
     if SERVICE_KEY_PATH is None:
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set in the environment.")
 
-    # Detect whether it's a JSON string or a file path
     if SERVICE_KEY_PATH.strip().startswith("{"):
-        # JSON string or dict passed directly
         print("[AUTH] Using inlined service account JSON.")
         key_info = json.loads(SERVICE_KEY_PATH)
         credentials = service_account.Credentials.from_service_account_info(
             key_info, scopes=["https://www.googleapis.com/auth/earthengine"]
         )
     else:
-        # File path passed
         print(f"[AUTH] Using service account file: {SERVICE_KEY_PATH}")
         credentials = service_account.Credentials.from_service_account_file(
             SERVICE_KEY_PATH, scopes=["https://www.googleapis.com/auth/earthengine"]
@@ -121,306 +122,446 @@ def init_google_earth_engine():
     print(f"[AUTH] Earth Engine initialized for project: {GCP_PROJECT}")
 
 def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]:
-    """
-    Search for the closest available OSM .pbf snapshot around {year}-12-31.
-    Tries multiple repositories automatically.
-    Returns (url, date_str) if found, else raises ValueError.
-    """
-    taskdate = datetime(task_year, 12, 31)
-    candidates = [
-        ("https://ftp.fau.de/osm-planet/pbf/planet-{planetdate}.osm.pbf", "fau.de"),
-        ("https://planet.openstreetmap.org/pbf/planet-{planetdate}.osm.pbf", "planet.osm.org"),
-    ]
+    import requests
+    from datetime import datetime, timedelta
 
-    for days_back in range(max_age_days + 1):
-        check_date = taskdate - timedelta(days=days_back)
-        date_str = check_date.strftime("%y%m%d")
-        for base_url, source in candidates:
-            url = base_url.format(planetdate=date_str)
+    taskdate = datetime(task_year, 12, 31)
+
+    def _try_osm_urls(urlbase: str, maxage: int) -> Optional[Tuple[str, str]]:
+        for days_back in range(maxage + 1):
+            check_date = taskdate - timedelta(days=days_back)
+            params = {
+                "year": check_date.strftime("%Y"),
+                "planetdate": check_date.strftime("%y%m%d"),
+            }
+            url = urlbase.format(**params)
             print(f"[CHECK] Trying {url} ...", end="")
             try:
-                r = requests.head(url, allow_redirects=True, timeout=10)
-                if r.status_code == 200:
-                    print(" found ✅")
+                r = requests.head(url, allow_redirects=False, timeout=10)
+                if r.status_code == requests.codes.ok:
+                    print(" found")
                     return url, check_date.strftime("%Y-%m-%d")
-            except requests.RequestException:
-                pass
+                if r.status_code == requests.codes.found and "Location" in r.headers:
+                    redirected_url = r.headers["Location"]
+                    new_response = requests.head(redirected_url, timeout=10)
+                    if new_response.status_code == requests.codes.ok:
+                        print(f" redirected ({redirected_url})")
+                        return redirected_url, check_date.strftime("%Y-%m-%d")
+            except requests.RequestException as e:
+                print(f" error ({e.__class__.__name__})", end="")
             print(" not found")
+        return None
 
-    # fallback to latest
-    latest_url = "https://ftp.fau.de/osm-planet/pbf/planet-latest.osm.pbf"
-    print(f"[FALLBACK] Using latest available: {latest_url}")
-    return latest_url, "latest"
+    faude_pbf = "https://ftp.fau.de/osm-planet/pbf/planet-{planetdate}.osm.pbf"
+    planet_osm_archive = "https://planet.openstreetmap.org/planet/{year}/planet-{planetdate}.osm.bz2"
 
+    if task_year >= 2020:
+        result = _try_osm_urls(faude_pbf, maxage=6)
+        if result:
+            return result
+
+    result = _try_osm_urls(planet_osm_archive, maxage=max_age_days)
+    if result:
+        return result
+
+    raise ValueError(
+        f"No OSM .pbf or .bz2 snapshot found within {max_age_days} days before {task_year}-12-31.\n"
+        f"Tried:\n  - {faude_pbf}\n  - {planet_osm_archive}\n"
+        f"Check the planet archive at https://planet.openstreetmap.org/planet/{task_year}/"
+    )
 
 def download_pbf(year: int, dest_path: Path) -> Path:
-    """
-    Download or reuse cached OSM PBF file for a given year (~Dec 31 snapshot).
-    Logs metadata about the selected file and source.
-    """
     metadata_path = dest_path.parent / "osm_download_metadata.json"
-
-    # If cached file exists, skip download but refresh metadata
-    if dest_path.exists():
-        size_mb = round(os.path.getsize(dest_path) / (1024 * 1024), 2)
-        print(f"[CACHE] Using cached PBF for {year}: {dest_path} ({size_mb} MB)")
-        url, found_date = _find_osm_pbf_url(year)  # refresh metadata info
-        metadata = {
-            "year_requested": year,
-            "download_date": date.today().isoformat(),
-            "pbf_url": url,
-            "pbf_date_found": found_date,
-            "size_mb": size_mb,
-            "cached": True
-        }
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2)
-        print(f"[CACHE] Metadata refreshed: {metadata_path}")
-        return dest_path
-
-    # Otherwise, search and download fresh
     url, found_date = _find_osm_pbf_url(year)
-    print(f"[DOWNLOAD] Using PBF file for {year}: {url}")
+    print(f"[DOWNLOAD] Preparing to fetch {url}")
 
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
-    with open(dest_path, "wb") as f:
-        shutil.copyfileobj(response.raw, f)
+    dest_stem = dest_path.stem
+    while any(dest_stem.endswith(ext) for ext in [".osm", ".pbf", ".bz2"]):
+        dest_stem = Path(dest_stem).stem
+    if url.endswith(".bz2"):
+        dest_path = dest_path.with_name(dest_stem + ".osm.bz2")
+    elif url.endswith(".pbf"):
+        dest_path = dest_path.with_name(dest_stem + ".osm.pbf")
+    else:
+        raise ValueError(f"Unsupported OSM file type in URL: {url}")
 
-    size_mb = round(os.path.getsize(dest_path) / (1024 * 1024), 2)
+    existing_size = dest_path.stat().st_size if dest_path.exists() else 0
+    head = requests.head(url, allow_redirects=True, timeout=10)
+    total_size = int(head.headers.get("Content-Length", 0))
+    supports_range = head.headers.get("Accept-Ranges", "none") != "none"
+
+    if existing_size > 0 and existing_size < total_size:
+        if supports_range:
+            print(f"[RESUME] Partial file detected ({existing_size / 1e6:.2f} MB). Resuming...")
+            headers = {"Range": f"bytes={existing_size}-"}
+            mode = "ab"
+        else:
+            print("[RESUME] Server does not support partial downloads. Restarting from scratch.")
+            existing_size = 0
+            headers = {}
+            mode = "wb"
+    else:
+        headers = {}
+        mode = "wb"
+
+    with requests.get(url, headers=headers, stream=True) as r:
+        r.raise_for_status()
+        chunk_size = 1024 * 1024
+        with open(dest_path, mode) as f, tqdm(
+            total=math.ceil(total_size / chunk_size) if total_size else None,
+            initial=math.ceil(existing_size / chunk_size) if existing_size else 0,
+            unit="MB",
+            desc=f"Downloading OSM {year}",
+            ascii=True,
+            ncols=80,
+        ) as pbar:
+            for chunk in r.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    if total_size:
+                        pbar.update(1)
+
+    final_size = dest_path.stat().st_size
+    if total_size > 0 and final_size != total_size:
+        raise IOError(
+            f"[ERROR] Download incomplete: expected {total_size} bytes, got {final_size} bytes"
+        )
+
+    print(f"[DOWNLOAD] Completed: {dest_path} ({final_size / 1e6:.2f} MB)")
+
     metadata = {
         "year_requested": year,
         "download_date": date.today().isoformat(),
         "pbf_url": url,
         "pbf_date_found": found_date,
-        "size_mb": size_mb,
-        "cached": False
+        "size_mb": round(final_size / (1024 * 1024), 2),
+        "cached": False,
+        "resumed": existing_size > 0,
+        "compressed": url.endswith(".bz2"),
     }
-
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+    print(f"[METADATA] Saved to: {metadata_path}")
 
-    print(f"Downloaded and logged metadata to {metadata_path}")
     return dest_path
 
-def osmium_to_text(pbf_path: Path, txt_path: Path) -> Path:
-    """Convert .pbf file to osmium text format."""
+def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
+    """
+    Convert an OSM PBF/BZ2 file directly to text using osmium export.
+    Optimized for global runs — filters by relevant keys only, no intermediate PBF.
+    Compatible with Osmium versions that expect JSON configs.
+    """
+    if not osm_path.exists():
+        raise FileNotFoundError(f"[ERROR] OSM input file not found: {osm_path}")
+
+    txt_dir.mkdir(parents=True, exist_ok=True)
+    out_path = txt_dir / f"{osm_path.stem}.txt"
+
+    # Extract unique OSM keys from config (e.g., highway, railway, man_made)
+    keys = sorted({k.split("=")[0] for k in config.keys()})
+
+    # Build JSON configuration
+    cfg = {"filters": [{"key": k} for k in keys]}
+    cfg_path = txt_dir / "osmium_keys.json"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+    print(f"[OSMIUM] Exporting {osm_path.name} → {out_path}")
+    print(f"[OSMIUM] Generated JSON filter config for {len(keys)} keys:")
+    print(", ".join(keys[:10]) + ("..." if len(keys) > 10 else ""))
+
+    # Build export command (no --strategy for compatibility)
     cmd = [
         "osmium", "export",
+        "--overwrite",
+        "--omit-rs",          # omit relation skeletons
+        "-c", str(cfg_path),  # JSON config file
         "-f", "text",
-        "-o", str(txt_path),
-        str(pbf_path)
+        "-o", str(out_path),
+        str(osm_path)
     ]
-    print(f"[OSMIUM] Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    return txt_path
 
-def split_text_to_csv(txt_file, csv_dir, config):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[ERROR] Osmium export failed:\n{result.stderr}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
 
+    print(f"[DONE] Export complete → {out_path}")
+
+    # Clean up config file
+    try:
+        cfg_path.unlink()
+    except Exception:
+        pass
+
+    return out_path
+
+# ----------------
+# STREAMING SPLIT 
+# ----------------
+def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, Path], config: Dict, max_rows:int = 1_000_000) -> List[Path]:
+    """
+    Stream the OSM text and write per-tag CSVs in shards up to max_rows each.
+    CSV schema: WKT,BURN (BURN = per-tag weight from config)
+    """
     os.makedirs(csv_dir, exist_ok=True)
+    target_tags = set(config.keys())  # e.g., {"highway=primary": 9, ...}
+    tag_files: Dict[str, csv.writer] = {}
+    tag_fhandles: Dict[str, any] = {}
+    tag_shard_counts: Dict[str, int] = defaultdict(int)
+    tag_row_counts: Dict[str, int] = defaultdict(int)
 
-    target_tags = set(config.keys())
-    print(f"[CONFIG] Loaded {len(target_tags)} tag=value weights from config")
-
-    tag_geoms = defaultdict(list)
+    out_paths: List[Path] = []
 
     with open(txt_file, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if not line.startswith("POINT("):
+        for line in f:
+            if not line.startswith("POINT(") and not line.startswith("LINESTRING(") and not line.startswith("POLYGON("):
                 continue
 
-            # Extract coordinates
-            coord_match = re.match(r'^POINT\(([-\d\.]+) ([-\d\.]+)\)', line)
-            if not coord_match:
+            geom_match = re.match(r'^(POINT|LINESTRING|POLYGON)\((.+)\)', line)
+            if not geom_match:
                 continue
+            wkt_end = line.index(")") + 1
+            wkt = line[:wkt_end]
 
-            lon, lat = coord_match.groups()
-
-            # Extract tags
-            tags = dict(re.findall(r'@?([\w\:\-]+)=([\w\-\.\%\:/]+)', line))
-
-            # if i < 100:
-            #     print(f"[DEBUG] Line {i+1}: tags = {tags}")
+            # Tags after geometry
+            tags_str = line[wkt_end:]
+            tags = dict(re.findall(r'@?([\w\:\-]+)=([\w\-\.\%\:/]+)', tags_str))
 
             for tag_val in target_tags:
                 if "=" not in tag_val:
-                    print(f"[WARNING] Skipping malformed config key: {tag_val}")
                     continue
                 tag, val = tag_val.split("=", 1)
-                if tag in tags and tags[tag] == val:
-                    tag_geoms[tag_val].append((lon, lat))
+                if tags.get(tag) == val:
+                    # open/rollover shard if needed
+                    if (tag_val not in tag_files) or (tag_row_counts[tag_val] >= max_rows):
+                        if tag_val in tag_fhandles:
+                            tag_fhandles[tag_val].close()
+                        safe = tag_val.replace(":", "_").replace("/", "_").replace("=", "_")
+                        shard_idx = tag_shard_counts[tag_val] + 1
+                        out_path = Path(csv_dir) / f"{safe}_{shard_idx:03d}.csv"
+                        fh = open(out_path, "w", newline="", encoding="utf-8")
+                        writer = csv.writer(fh)
+                        writer.writerow(["WKT", "BURN"])
+                        tag_files[tag_val] = writer
+                        tag_fhandles[tag_val] = fh
+                        tag_shard_counts[tag_val] = shard_idx
+                        tag_row_counts[tag_val] = 0
+                        out_paths.append(out_path)
 
-    total = sum(len(v) for v in tag_geoms.values())
-    print(f"[DONE] Processed {i+1:,} lines, matched {total:,} features")
+                    # 🔑 bake the weight here
+                    burn = int(config[tag_val])
+                    tag_files[tag_val].writerow([wkt, burn])
+                    tag_row_counts[tag_val] += 1
 
-    csv_files = []
-    for tag_val, points in tag_geoms.items():
-        tag_safe = tag_val.replace(":", "_").replace("/", "_")
-        out_path = os.path.join(csv_dir, f"{tag_safe}.csv")
-        with open(out_path, "w", newline="", encoding="utf-8") as out_csv:
-            writer = csv.writer(out_csv)
-            writer.writerow(["WKT", "BURN"])
-            for lon, lat in points:
-                writer.writerow([f"POINT({lon} {lat})", 1])
-        csv_files.append(out_path)
+    for fh in tag_fhandles.values():
+        try:
+            fh.close()
+        except:
+            pass
 
-    return csv_files
+    print(f"[SPLIT] {txt_file} → {len(out_paths)} CSV shards")
+    return out_paths
+
+# ------------------------------
+# PARALLEL RASTERIZATION (GDAL API)
+# ------------------------------
+def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
+                      bounds: Tuple[float,float,float,float], res: float):
+    """
+    Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Int16 GeoTIFF.
+    """
+    # GDAL can read CSV with WKT using -oo options via CLI; here we use Rasterize with layer creation via VRT trick.
+    # Simpler approach: call gdal.Rasterize directly on CSV (OGR handles WKT if header is WKT).
+    opts = gdal.RasterizeOptions(
+        format="GTiff",
+        outputType=gdalconst.GDT_Int16,
+        initValues=0,
+        burnValues=None,                # read from attribute
+        attribute="BURN",
+        xRes=res,
+        yRes=res,
+        targetAlignedPixels=True,
+        outputSRS="EPSG:4326",
+        outputBounds=bounds,
+        creationOptions=[
+            "TILED=YES",
+            "BLOCKXSIZE=1024",
+            "BLOCKYSIZE=1024",
+            "COMPRESS=LZW",
+        ],
+    )
+    # Ensure directory
+    Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
+    # Rasterize
+    gdal.Rasterize(str(out_tif), str(in_csv), options=opts)
+    return Path(out_tif)
 
 def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,float,float], res: float) -> List[Path]:
-    """
-    Rasterize each CSV into a GeoTIFF using gdal_rasterize.
-    Each CSV has columns WKT,BURN.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    rasters = []
+    out_tifs = [out_dir / (Path(c).stem + ".tif") for c in csvs]
+    num_cpus = max(1, (os.cpu_count() or 2) - 1)
+    print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers...")
 
-    xmin, ymin, xmax, ymax = bounds
+    with ProcessPoolExecutor(max_workers=num_cpus) as exe:
+        list(exe.map(_rasterize_single, csvs, out_tifs, itertools.repeat(bounds), itertools.repeat(res)))
 
-    for csv in csvs:
-        safe_name = csv.stem.replace("=", "_") + ".tif"
-        out_tif = out_dir / safe_name
-        args = [
-            "gdal_rasterize",
-            "-a", "BURN",
-            "-tr", str(res), str(res),
-            "-te", str(xmin), str(ymin), str(xmax), str(ymax),
-            "-a_srs", "EPSG:4326",
-            "-ot", "Int16",              # força saída Int16
-            "-co", "COMPRESS=LZW",       # compressão
-            str(csv), str(out_tif)
-        ]
+    return out_tifs
 
-        print(f"[RASTERIZE] {csv} -> {out_tif}")
-        subprocess.run(args, check=True)
-        rasters.append(out_tif)
+# ---------------
+# WEIGHTED MERGE 
+# ---------------
 
-    return rasters
 
-def run_gdal_calc(rasters: List[Path], categories: Dict, out_path: Path, weighted: bool = True):
+def merge_tag_shards(raster_dir: Path) -> List[Path]:
     """
-    Combine multiple rasters into one using gdal_calc.py.
-    If weighted=True, apply category weights.
-    If weighted=False, simply sum rasters.
+    Merge all tag-level shard rasters (e.g., highway_residential_001, _002)
+    into a single raster per tag using gdal_calc.
+    Returns a list of merged tag rasters.
     """
+    rasters = sorted(raster_dir.glob("*.tif"))
     if not rasters:
-        raise ValueError("No rasters provided to run_gdal_calc")
+        print("[TAG MERGE] No rasters found to merge by tag.")
+        return []
 
+    tag_groups: Dict[str, List[Path]] = defaultdict(list)
+    for r in rasters:
+        base = re.sub(r"_[0-9]{3}$", "", r.stem)  # strip trailing _001 etc.
+        tag_groups[base].append(r)
+
+    merged_paths: List[Path] = []
+    for base, group in tag_groups.items():
+        if len(group) == 1:
+            merged_paths.append(group[0])
+            continue
+        print(f"[TAG MERGE] Merging {len(group)} shards for tag: {base}")
+        out_path = raster_dir / f"{base}.tif"
+        _calc_sum(group, out_path)
+        merged_paths.append(out_path)
+        # optional cleanup
+        for g in group:
+            if g != out_path:
+                try:
+                    g.unlink()
+                except:
+                    pass
+    print(f"[TAG MERGE] Produced {len(merged_paths)} tag-level rasters.")
+    return merged_paths
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def _calc_sum(inputs: List[Path], out_path: Path):
+    """
+    Sum ≤26 rasters safely (A+B+...), treating NoData as 0.
+    Unsets NoData on all inputs and output to avoid propagation.
+    """
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    if len(rasters) > len(letters):
-        raise ValueError(f"Too many rasters for one gdal_calc call ({len(rasters)} > 26)")
+    if len(inputs) == 0:
+        raise ValueError("No rasters provided to _calc_sum")
+    if len(inputs) > 26:
+        raise ValueError("Too many inputs for a single gdal_calc call (max=26)")
+
+    # Unset NoData before summing
+    for r in inputs:
+        subprocess.run(["gdal_edit.py", "-unsetnodata", str(r)], check=True)
+
+    calc_expr = " + ".join([f"nan_to_num({chr(65+i)})" for i in range(len(inputs))])
 
     args = [
-        "gdal_calc.py",
-        "--overwrite",
-        "--outfile", str(out_path),
+        "gdal_calc.py", "--quiet", "--overwrite",
+        f"--outfile={str(out_path)}",
+        "--type=Int16",
         "--co=COMPRESS=LZW",
-        "--type=Int16"
+        "--calc", calc_expr
     ]
-
-    expr_terms = []
-    for i, raster in enumerate(rasters):
-        letter = letters[i]
-        args.append(f"-{letter}")
-        args.append(str(raster))
-
-        weight = 1
-        if weighted:
-            for tagval, w in categories.items():
-                tag_safe = tagval.replace(":", "_").replace("/", "_")
-                if tag_safe in raster.name:
-                    weight = w
-                    break
-        expr_terms.append(f"{weight}*{letter}")
-
-    args.append(f"--calc={' + '.join(expr_terms)}")
-    print(f"[DEBUG] gdal_calc expression: {args[-1]}")
+    for i, r in enumerate(inputs):
+        args.extend([f"-{chr(65+i)}", str(r)])
     subprocess.run(args, check=True)
+    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
 
-def apply_weights_merge(rasters: List[Path], categories: Dict, merged_path: Path):
+
+def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
     """
-    Merge rasters with weights applied, handling >26 rasters by chunking and parallelizing.
-    - Weighted merges for first-level chunks
-    - Simple sum for higher-level merges
-    - Automatically recurses if >26 intermediates
+    Sum any number of rasters safely by merging in chunks (≤26 per gdal_calc call).
+    Each round merges chunks in parallel for speed.
     """
-    if not rasters:
-        print("No rasters to merge.")
+    if len(inputs) == 0:
+        raise ValueError("No rasters provided to _calc_sum_safe")
+
+    # If only one input, just copy
+    if len(inputs) == 1:
+        shutil.copy(inputs[0], out_path)
+        subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
         return
 
-    print(f"[MERGE] Found {len(rasters)} rasters...")
+    tmp_dir = out_path.parent / "_tmp_merge_chunks"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Helper for chunk merging
-    def merge_chunk(i, chunk):
-        tmp_out = merged_path.parent / f"merge_part{i+1}.tif"
-        print(f"[CHUNK {i+1}] Merging {len(chunk)} rasters → {tmp_out}")
-        run_gdal_calc(chunk, categories, tmp_out, weighted=True)
-        return tmp_out
+    current = inputs
+    round_idx = 0
+    num_threads = max(1, min(os.cpu_count() or 2, 16))  # limit to avoid I/O thrash
 
-    # Base case: 26 or fewer rasters
-    if len(rasters) <= 26:
-        run_gdal_calc(rasters, categories, merged_path, weighted=True)
-        print(f"Final merged raster: {merged_path}")
+    while len(current) > 1:
+        round_idx += 1
+        next_round: List[Path] = []
+        chunks = [current[i:i + chunk_size] for i in range(0, len(current), chunk_size)]
+        print(f"[MERGE] Round {round_idx}: {len(current)} rasters → {len(chunks)} chunks (parallel {num_threads})")
+
+        with ThreadPoolExecutor(max_workers=num_threads) as exe:
+            futures = {}
+            for ci, chunk in enumerate(chunks):
+                out = tmp_dir / f"sum_{round_idx:02d}_{ci:03d}.tif"
+                fut = exe.submit(_calc_sum, chunk, out)
+                futures[fut] = out
+
+            for fut in as_completed(futures):
+                fut.result()
+                next_round.append(futures[fut])
+
+        # Clean up older intermediates from previous round
+        if round_idx > 1:
+            for p in current:
+                if p.parent == tmp_dir and p.exists():
+                    try:
+                        p.unlink()
+                    except:
+                        pass
+
+        current = next_round
+
+    shutil.move(str(current[0]), str(out_path))
+    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"[MERGE] Final merged raster: {out_path}")
+
+
+def sum_all_rasters(inputs: List[Path], out_path: Path):
+    """
+    Wrapper for safe, multi-threaded summation of any number of rasters.
+    """
+    if not inputs:
+        print("[MERGE] No rasters to sum.")
         return
+    print(f"[MERGE] Summing {len(inputs)} rasters into {out_path.name} (multi-threaded) ...")
+    _calc_sum_safe(inputs, out_path)
 
-    # Chunking setup
-    chunk_size = 20
-    chunks = [rasters[i:i+chunk_size] for i in range(0, len(rasters), chunk_size)]
-    temp_files = []
-
-    # Run merges in parallel (I/O-bound → threads are fine)
-    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
-        futures = {executor.submit(merge_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
-        for future in as_completed(futures):
-            try:
-                temp_files.append(future.result())
-            except Exception as e:
-                print(f"[ERROR] Chunk {futures[future]+1} failed: {e}")
-
-    print(f"[MERGE] {len(temp_files)} intermediate rasters created.")
-
-    # If the intermediate rasters still exceed 26, recurse
-    if len(temp_files) > 26:
-        print("[MERGE] Too many intermediates, merging recursively...")
-        apply_weights_merge(temp_files, categories, merged_path)
-        return
-
-    # Final simple merge (unweighted)
-    print("[MERGE] Combining intermediate rasters (unweighted)...")
-    run_gdal_calc(temp_files, categories, merged_path, weighted=False)
-    print(f"✅ Done. Final merged raster: {merged_path}")
-
-    # Cleanup
-    for tmp in temp_files:
-        try:
-            os.remove(tmp)
-            print(f"[CLEANUP] Removed {tmp}")
-        except Exception as e:
-            print(f"[CLEANUP] Could not remove {tmp}: {e}")
-
+# ------------------------------
+# GCS / GEE EXPORT (unchanged)
+# ------------------------------
 def upload_to_gcs(local_path: Path, gcs_uri: str):
-    """Upload a local raster to Google Cloud Storage using gsutil."""
     print(f"[UPLOAD] {local_path.name} → {gcs_uri}")
-
-    # Find gsutil executable (handle .cmd and .CMD on Windows)
     gsutil_path = shutil.which("gsutil") or shutil.which("gsutil.cmd") or shutil.which("gsutil.CMD")
-
     if gsutil_path is None:
         print("[ERROR] gsutil not found. Make sure Google Cloud SDK is installed and in your PATH.")
         raise FileNotFoundError("gsutil executable not found.")
-
     try:
-        cmd = [gsutil_path, "cp", str(local_path), gcs_uri]
-        subprocess.run(cmd, check=True)
+        subprocess.run([gsutil_path, "cp", str(local_path), gcs_uri], check=True)
         print("[UPLOAD] Uploaded successfully.")
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] Upload failed for {local_path.name}: {e}")
         raise
 
 def ensure_ee_folder_exists(folder_path: str):
-    """
-    Ensure that an Earth Engine asset folder exists.
-    If it doesn't, create it recursively.
-    """
     try:
         ee.data.getAsset(folder_path)
         print(f"[EE FOLDER] Exists: {folder_path}")
@@ -428,22 +569,16 @@ def ensure_ee_folder_exists(folder_path: str):
         parent = "/".join(folder_path.split("/")[:-1])
         if parent and not parent.startswith("projects/"):
             parent = f"projects/{GCP_PROJECT}/assets/{parent}"
-        # Recursively ensure parent exists first
         if parent and parent != folder_path:
             ensure_ee_folder_exists(parent)
         print(f"[EE FOLDER] Creating: {folder_path}")
         ee.data.createAsset({'type': 'Folder'}, folder_path)
 
 def import_to_earth_engine(asset_id: str, gcs_uri: str):
-    """Import a GeoTIFF from GCS to Earth Engine using the Python API (service account safe)."""
     print(f"[EE IMPORT] {gcs_uri} → {asset_id}")
-
     try:
-        # Ensure parent folder exists
         folder_path = "/".join(asset_id.split("/")[:-1])
         ensure_ee_folder_exists(folder_path)
-
-        # Check if asset already exists
         try:
             ee.data.getAsset(asset_id)
             print(f"[EE IMPORT] Asset already exists: {asset_id} — skipping upload.")
@@ -457,55 +592,48 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
             'bands': [{'id': 'b1'}],
             'pyramidingPolicy': 'MEAN'
         }
-
         task = ee.data.startIngestion(str(uuid.uuid4()), params)
         print(f"[EE IMPORT] Ingestion task started: {task['id']}")
-
     except Exception as e:
         print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
         raise
 
-def export_rasters_to_gee(raster_dir: Path, year: int):
-    """
-    Upload all rasters (individual + merged) to Cloud Storage,
-    and import them to Earth Engine.
-    """
+def export_rasters_to_gee(raster_dir: Path, year: int, upload_merged_only: bool = False):
     print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
 
-    # Collect both per-feature rasters and the final merged one
-    tifs = list(raster_dir.glob("*.tif"))
-
-    # Also include the final merged raster at year_dir level if it exists
-    merged_candidate = raster_dir.parent / f"flii_infra_{year}.tif"
-    if merged_candidate.exists():
-        tifs.append(merged_candidate)
-        print(f"[EXPORT] Including merged raster: {merged_candidate.name}")
+    if upload_merged_only:
+        merged_candidate = raster_dir.parent / f"flii_infra_{year}.tif"
+        if not merged_candidate.exists():
+            print("[EXPORT] Merged raster not found — cannot upload merged-only.")
+            return
+        tifs = [merged_candidate]
+        print(f"[EXPORT] Uploading only merged raster: {merged_candidate.name}")
+    else:
+        tifs = list(raster_dir.glob("*.tif"))
+        merged_candidate = raster_dir.parent / f"flii_infra_{year}.tif"
+        if merged_candidate.exists():
+            tifs.append(merged_candidate)
+            print(f"[EXPORT] Including merged raster: {merged_candidate.name}")
 
     if not tifs:
         print("[EXPORT] No rasters found to export.")
         return
 
     exported_assets = []
-
     for tif in tifs:
-        # Normalize name and remote paths
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
-        asset_id = f"{EE_ASSET_ROOT}/{year}/{tif.stem}"
+        safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
+        asset_id = f"{EE_ASSET_ROOT}/{year}/{safe_stem}"
 
         try:
-            # Upload to Cloud Storage
             upload_to_gcs(tif, gcs_uri)
-
-            # Import to Earth Engine
             import_to_earth_engine(asset_id, gcs_uri)
-
             exported_assets.append({
                 "filename": tif.name,
                 "asset_id": asset_id,
                 "gcs_uri": gcs_uri,
                 "status": "imported"
             })
-
         except subprocess.CalledProcessError as e:
             print(f"[ERROR] Failed for {tif.name}: {e}")
             exported_assets.append({
@@ -515,7 +643,6 @@ def export_rasters_to_gee(raster_dir: Path, year: int):
                 "status": f"failed - {e}"
             })
 
-    # Save summary metadata locally and upload to GCS
     metadata_path = raster_dir / f"gee_export_metadata_{year}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(exported_assets, f, indent=2)
@@ -529,26 +656,38 @@ def export_rasters_to_gee(raster_dir: Path, year: int):
 
     print(f"Export summary saved: {gcs_metadata_uri}")
 
-
+# ------------------------------
+# CLEANUP
+# ------------------------------
+def cleanup_intermediates(year_dir: Path):
+    print(f"[CLEANUP] Removing intermediates in {year_dir}")
+    for sub in ["csvs", "rasters/_tmp_merge"]:
+        p = year_dir / sub
+        shutil.rmtree(p, ignore_errors=True)
 
 # ------------------------------
-# MAIN LOGIC
+# MAIN LOGIC (optimized pipeline)
 # ------------------------------
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=date.today().year)
     parser.add_argument("--resolution", type=float, default=0.00269)
     parser.add_argument("--bounds", nargs=4, type=float, metavar=("xmin", "ymin", "xmax", "ymax"),
                         default=[-180, -90, 180, 90])
+    parser.add_argument("--max_csv_rows", type=int, default=1_000_000, help="Max rows per tag CSV shard (streaming split).")
+    parser.add_argument("--cleanup", action="store_true", help="Remove intermediate files after successful processing.")
+    parser.add_argument("--upload_merged_only", action="store_true", help="If set, upload only the merged raster to GCS and GEE instead of all tag rasters.")
     args = parser.parse_args()
 
     year = args.year
     res = args.resolution
     bounds = tuple(args.bounds)
+    max_rows = args.max_csv_rows
+    do_cleanup = args.cleanup
+    upload_merged_only = args.upload_merged_only
 
     year_dir = OUTPUT_BASE_DIR / f"{year}"
-    txt_file = year_dir / f"osm_{year}.txt"
+    txt_dir = year_dir
     csv_dir = year_dir / "csvs"
     raster_dir = year_dir / "rasters"
     merged_path = year_dir / f"flii_infra_{year}.tif"
@@ -559,30 +698,53 @@ def main():
 
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
-
-    # Access the nested 'weights' dictionary
     categories = config.get("osm_categories", {}).get("weights", {})
 
-    if not pbf_path.exists():
-        download_pbf(year, pbf_path)
+    with log_time("[1] Download OSM PBF"):
+        if not pbf_path.exists() and not any(year_dir.glob("osm_*.osm.bz2")):
+            download_pbf(year, pbf_path)
+        else:
+            print("[SKIP] PBF/BZ2 already present.")
 
-    if not txt_file.exists():
-        osmium_to_text(pbf_path, txt_file)
+    with log_time("[2] Convert PBF to text"):
+        txt_path = next(txt_dir.glob("*.txt"), None)
+        if txt_path is None:
+            osm_source = next(iter(year_dir.glob("osm_*.osm.*")))
+            osmium_to_text(osm_source, txt_dir, categories)
+        else:
+            print("[SKIP] Text file already exists.")
 
-    print("[1] Splitting text into CSVs...")
-    csvs = split_text_to_csv(txt_file, csv_dir, categories)
-    csvs = [Path(f) for f in csvs]
+    with log_time("[3] Split OSM text to CSV (streaming shards)"):
+        txt_files = list(txt_dir.glob("*.txt"))
+        if not txt_files:
+            print("[WARN] No OSM text file found.")
+        else:
+            split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
 
-    print("[2] Rasterizing CSVs...")
-    rasters = rasterize_all(csvs, raster_dir, bounds, res)
+    with log_time("[4] Rasterize CSVs (parallel)"):
+        csv_files = list(csv_dir.glob("*.csv"))
+        if not csv_files:
+            print("[WARN] No CSV files to rasterize.")
+        else:
+            rasters = rasterize_all(csv_files, raster_dir, bounds, res)
 
-    print("[3] Applying weights + merging...")
-    apply_weights_merge(rasters, categories, merged_path)
+    with log_time("[5] Merge all rasters"):
+        tag_rasters = merge_tag_shards(raster_dir)
+        sum_all_rasters(tag_rasters, merged_path)
 
-    print("[4] Exporting rasters to Google Earth Engine...")
-    init_google_earth_engine()
-    export_rasters_to_gee(raster_dir, year)
+    with log_time("[6] Initialize Earth Engine + export rasters"):
+        init_google_earth_engine()
+        export_rasters_to_gee(raster_dir, year, upload_merged_only)
 
+
+    if do_cleanup:
+        with log_time("[7] Cleanup intermediates"):
+            cleanup_intermediates(year_dir)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[FATAL] Pipeline failed: {e}")
+        sys.exit(1)
+

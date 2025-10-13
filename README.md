@@ -3,9 +3,9 @@
 
 ## Overview
 
-The **FLII OSM** task automates the processing of OpenStreetMap (OSM) data to generate spatial infrastructure indicators used in the *Forest Landscape Integrity Index (FLII)*.
+The **FLII OSM** task automates the processing of OpenStreetMap (OSM) data to generate infrastructure layers used in the *Forest Landscape Integrity Index (FLII)*.
 
-This script fetches, processes, rasterizes, and exports OSM features into multiband GeoTIFFs, and publishes them as Google Earth Engine (EE) assets for use in FLII analyses.
+This script fetches, processes, rasterizes, and exports OSM features into GeoTIFFs, and publishes them as Google Earth Engine (EE) assets for use in FLII generation.
 
 ---
 
@@ -15,7 +15,7 @@ This script fetches, processes, rasterizes, and exports OSM features into multib
    Downloads the latest or year-specific `.osm.pbf` snapshot from official OSM mirrors.
 
 2. **Convert PBF file → text**  
-   Uses `osmium` to export the OSM file into a human-readable `.txt` format.
+   Uses `osmium` to convert the OSM file (`.pbf`, `.bz2`) into a `.txt` format.
 
 3. **Split text into filtered CSVs**  
    - Extracts points matching the OSM tags and subcategories defined in [`osm_config.json`](osm_config.json).  
@@ -25,16 +25,13 @@ This script fetches, processes, rasterizes, and exports OSM features into multib
    Converts each CSV into a GeoTIFF using `gdal_rasterize` within specified geographic bounds and resolution (e.g., `highway_footway.tiff`).
 
 5. **Apply weights and merge rasters**  
-   Merges all individual rasters into one weighted multiband raster representing the final FLII infrastructure layer.
+   Applies subcategory-specific weights (defined in `osm_config.json`) to each raster and them all into one weighted raster representing the final infrastructure layer.
 
 6. **Export results to Google Cloud Storage (GCS)**  
    Uploads each GeoTIFF (and metadata) to the configured GCS bucket.
 
 7. **Import to Google Earth Engine (EE)**  
-   Publishes each raster as an EE asset using a service account for automated cloud integration.
-
-8. **Clean up**  
-   Optionally removes intermediate files from both local storage and GCS after successful import.
+   Publishes each raster as an EE asset.
 
 ---
 
@@ -73,6 +70,7 @@ FLII_OSM/
 ```
 
 ## License
-Copyright (C) 2025 Wildlife Conservation Society
+Copyright (C) 2025 Wildlife Conservation Society.
+
 The files in this repository are part of the task framework for calculating 
 the Forest Landscape Integrity Index [(https://www.forestintegrity.com/)](https://www.forestintegrity.com/) and are released under the GPL license: [https://www.gnu.org/licenses/#GPL](https://www.gnu.org/licenses/#GPL). See [LICENSE](./LICENSE) for details.
