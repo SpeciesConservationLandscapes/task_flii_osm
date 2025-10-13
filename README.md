@@ -56,11 +56,11 @@ FLII_OSM/
 │     ├── 2023/
 │     ├── 2024/
 │     │     ├── csvs/
-│     │     ├── <category=subcategory>.csv
-│     ├── rasters/
-│     │     ├── gee_export_metadata_2024.json
-│     │     ├── <category_subcategory>.tiff
-│     ├── flii_osm_2024_merged.tif
+│     │     │     └── <category=subcategory>.csv
+│     │     └── rasters/
+│     │           ├── gee_export_metadata_2024.json
+│     │           └── <category_subcategory>.tiff
+│     ├── flii_infra_2024.tif
 │     ├── osm_2024.osm.pbf
 │     └── osm_2024.txt
 ├── .env
