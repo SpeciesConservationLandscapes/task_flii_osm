@@ -7,6 +7,8 @@ The **FLII OSM** task automates the processing of OpenStreetMap (OSM) data to ge
 
 This script fetches, processes, rasterizes, and exports OSM features into GeoTIFFs, and publishes them as Google Earth Engine (EE) assets for use in FLII generation.
 
+It is recommended to run the FLII OSM pipeline inside a Docker container to ensure a consistent and reproducible environment.
+
 ---
 
 ## What does this task do?
@@ -15,17 +17,17 @@ This script fetches, processes, rasterizes, and exports OSM features into GeoTIF
    Downloads the latest or year-specific `.osm.pbf` snapshot from official OSM mirrors.
 
 2. **Convert PBF file → text**  
-   Uses `osmium` to convert the OSM file (`.pbf`, `.bz2`) into a `.txt` format.
+   Uses `osmium` to convert the OSM file into a `.txt` format.
 
-3. **Split text into filtered CSVs**  
+3. **Split text into filtered CSVs with tag-specific weights**  
    - Extracts features (e.g. lines, points) matching the OSM tags and subcategories defined in [`osm_config.json`](osm_config.json).  
-   - Writes one CSV per tag-value combination (e.g., `highway=footway.csv`).
+   - Writes one CSV per tag-value combination (e.g., `highway=footway.csv`) with the geographic WKT information, and subcategory-specific weights defined in `osm_config.json`.
 
 4. **Rasterize each CSV file**  
-   Converts each CSV into a GeoTIFF using `gdal_rasterize` within specified geographic bounds and resolution (e.g., `highway_footway.tiff`).
+   Converts each CSV into a GeoTIFF using `gdal_rasterize` (e.g., `highway_footway.tif`).
 
-5. **Apply weights and merge rasters**  
-   Applies subcategory-specific weights (defined in `osm_config.json`) to each raster and them all into one weighted raster representing the final infrastructure layer.
+5. **Merge rasters into a final infrastructure layer**  
+   Merges rasters into one weighted raster representing the final infrastructure layer.
 
 6. **Export results to Google Cloud Storage (GCS)**  
    Uploads each GeoTIFF (and metadata) to the configured GCS bucket.
@@ -67,6 +69,35 @@ FLII_OSM/
 ├── Dockerfile
 ├── Makefile
 └── README.md
+```
+
+## Example usage
+To run the task:
+
+```
+python src/task.py --upload_merged_only
+```
+
+By default, the code runs for the year to date, outputs 0.00269 degrees resolution rasters (300 meters near the Equator), and for global bounds (e.g. -90, -180, 90, 180). These are customizable settings.
+
+If running for a specific year (not the current year), set the  `--year` flag:
+```
+python src/task.py --year 2024 --upload_merged_only
+```
+
+If you want to upload all tag-level rasters (e.g. highway_primary.tif, power_plant.tif, etc) to Cloud Storage and as an GEE asset, remove the    `--upload_merged_only` flag (more cloud/GEE storage space needed).
+```
+python src/task.py --year 2024
+```
+
+If you want to change the raster resolution, you can change the `--resolution` flag. E.g. 100 m (near the Equator):
+```
+python src/task.py --year 2024 –resolution 0.0009 --upload_merged_only
+```
+
+If you want to clean up intermediate files from the container/VM right away (e.g. CSV files, temporary merge rasters, etc), you can use the `--cleanup` flag.
+```
+python src/task.py --year 2024 --cleanup
 ```
 
 ## License
