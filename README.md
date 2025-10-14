@@ -92,7 +92,7 @@ python src/task.py --year 2024
 
 If you want to change the raster resolution, you can change the `--resolution` flag. E.g. 100 m (near the Equator):
 ```
-python src/task.py --year 2024 –resolution 0.0009 --upload_merged_only
+python src/task.py --year 2024 --resolution 0.0009 --upload_merged_only
 ```
 
 If you want to clean up intermediate files from the container/VM right away (e.g. CSV files, temporary merge rasters, etc), you can use the `--cleanup` flag.

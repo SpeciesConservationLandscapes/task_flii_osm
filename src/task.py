@@ -139,17 +139,20 @@ def init_google_earth_engine():
 
 def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]:
     """
-    Finds the closest OSM file (.pbf or .bz2) for the given year, checking up to max_age_days before Dec 31.
+    Finds the closest OSM file (.pbf or .bz2) for the year before the given year, 
+    checking up to max_age_days.
+    For example, if task_year=2024, it searches around 2023-12-31.
     It checks multiple known mirror URLs.
     """
     import requests
     from datetime import datetime, timedelta
 
-    taskdate = datetime(task_year, 12, 31)
+    taskdate = datetime(task_year - 1, 12, 31)
 
     def _try_osm_urls(urlbase: str, maxage: int) -> Optional[Tuple[str, str]]:
         """
-        Checks the given URL base for the OSM file, trying dates from 'taskdate' back to 'taskdate - maxage days'.
+        Checks the given URL base for the OSM file, 
+        trying dates from 'taskdate' back to 'taskdate - maxage days'.
         """
         for days_back in range(maxage + 1):
             check_date = taskdate - timedelta(days=days_back)

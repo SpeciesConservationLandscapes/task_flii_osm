@@ -12,11 +12,11 @@ RUN apt-get update && \
 RUN ln -s /usr/bin/python3 /usr/bin/python
 RUN pip install --upgrade pip
 RUN pip install \
-    requests \
-    tqdm \
-    earthengine-api \
-    google-cloud-storage \
-    google-api-python-client
+    requests==2.32.5 \
+    tqdm==4.67.1 \
+    earthengine-api==1.6.11 \
+    google-cloud-storage==3.4.1 \
+    google-api-python-client==2.184.0
 
 WORKDIR /app
 COPY src ./src
