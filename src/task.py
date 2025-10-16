@@ -71,10 +71,20 @@ def log_time(label: str):
         elapsed = time.time() - start
         print(f"[TIMER] Finished {label} — {elapsed/60:.2f} min ({elapsed:.1f} sec)")
 
+def degrees_to_meters(res_deg: float) -> int:
+    """
+    Approximate degrees to meters conversion at the equator.
+    Used to append resolution suffixes like '_300m' to raster filenames.
+    """
+
+    meters = res_deg * 111_320
+    return int(math.ceil(meters / 10.0) * 10)
+
 def activate_gcloud_service_account():
     """
     Activates the gcloud service account using the provided key file or inlined JSON. 
     """
+
     print(f"[GCP AUTH] Activating service account for gcloud: {SERVICE_ACCOUNT}")
 
     # Find gcloud in PATH.
@@ -117,8 +127,10 @@ def init_google_earth_engine():
     Initializes the Earth Engine API.
     Sets cloud project.
     """
+
     activate_gcloud_service_account()
     print(f"[AUTH] Authenticating with service account: {SERVICE_ACCOUNT}")
+
     if SERVICE_KEY_PATH is None:
         raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set in the environment.")
 
@@ -144,6 +156,7 @@ def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]
     For example, if task_year=2024, it searches around 2023-12-31.
     It checks multiple known mirror URLs.
     """
+
     import requests
     from datetime import datetime, timedelta
 
@@ -204,6 +217,7 @@ def download_pbf(year: int, dest_path: Path) -> Path:
     Supports resuming partial downloads if the server allows it.
     Stores metadata (size, URL, date) about the download in a JSON file alongside the data.
     """
+
     metadata_path = dest_path.parent / "osm_download_metadata.json"
     url, found_date = _find_osm_pbf_url(year)
     print(f"[DOWNLOAD] Preparing to fetch {url}")
@@ -338,6 +352,7 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     This allows flexible per-tag rasterization later.
     Shards are named like highway_residential_001.csv, highway_residential_002.csv, etc.
     """
+    
     os.makedirs(csv_dir, exist_ok=True)
     target_tags = set(config.keys())  # e.g., {"highway=primary": 9, ...}
     tag_files: Dict[str, csv.writer] = {}
@@ -402,11 +417,16 @@ def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
     """
     Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Int16 GeoTIFF.
     """
+
+    res_m = degrees_to_meters(res)
+    out_tif = Path(out_tif)
+    out_tif = out_tif.with_name(f"{out_tif.stem}_{res_m}m.tif")
+
     opts = gdal.RasterizeOptions(
         format="GTiff",
         outputType=gdalconst.GDT_Int16,
         initValues=0,
-        burnValues=None,                # read from attribute
+        burnValues=None, # read from attribute
         attribute="BURN",
         xRes=res,
         yRes=res,
@@ -480,7 +500,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
-    Sum ≤26 (limit) rasters safely (A+B+...), treating NoData as 0.
+    Sum ≤26 (limit) rasters safely (A+B+...).
     Unsets NoData on all inputs and output to avoid propagation.
     """
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" # 26.
@@ -623,11 +643,19 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
         except ee.ee_exception.EEException:
             pass
 
+        # Extract resolution if encoded in filename (e.g., *_300m.tif)
+        res_match = re.search(r"_(\d{2,4})m", asset_id)
+        res_m = int(res_match.group(1)) if res_match else None
+
         params = {
             'id': asset_id,
             'tilesets': [{'sources': [{'uris': [gcs_uri]}]}],
             'bands': [{'id': 'b1'}],
-            'pyramidingPolicy': 'MEAN'
+            'pyramidingPolicy': 'MEAN',
+            'properties': {
+                'year': int(re.search(r"/(\d{4})/", asset_id).group(1)) if re.search(r"/(\d{4})/", asset_id) else None,
+                'resolution_m': res_m
+            }
         }
         task = ee.data.startIngestion(str(uuid.uuid4()), params)
         print(f"[EE IMPORT] Ingestion task started: {task['id']}")
@@ -635,16 +663,19 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
         print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
         raise
 
-def export_rasters_to_gee(raster_dir: Path, year: int, upload_merged_only: bool = False):
+def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
     If upload_merged_only=True, uploads only the merged final raster (infrastucture layer).
     Otherwise, uploads all per-tag rasters plus the merged one.
     Each uploaded raster is registered as a new GEE asset.
     """
+
     print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
 
+    res_m = degrees_to_meters(res)
+
     if upload_merged_only:
-        merged_candidate = raster_dir.parent / f"flii_infra_{year}.tif"
+        merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
         if not merged_candidate.exists():
             print("[EXPORT] Merged raster not found — cannot upload merged-only.")
             return
@@ -652,7 +683,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, upload_merged_only: bool 
         print(f"[EXPORT] Uploading only merged raster: {merged_candidate.name}")
     else:
         tifs = list(raster_dir.glob("*.tif"))
-        merged_candidate = raster_dir.parent / f"flii_infra_{year}.tif"
+        merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
         if merged_candidate.exists():
             tifs.append(merged_candidate)
             print(f"[EXPORT] Including merged raster: {merged_candidate.name}")
@@ -710,18 +741,44 @@ def cleanup_intermediates(year_dir: Path):
 
 def main():
     """
-    Execute all stages.
+    Runs all stages from OSM download to Earth Engine export.
     """
 
     # Parse command-line arguments.
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--year", type=int, default=date.today().year)
-    parser.add_argument("--resolution", type=float, default=0.00269)
+    parser = argparse.ArgumentParser(prog="python src/task.py",
+        description=(
+            "Run the FLII OSM-based infrastructure pipeline.\n\n"
+            "This pipeline downloads OpenStreetMap global data for the specified year, "
+            "filters features based on configured tags and weights (in osm_config.json), "
+            "converts them to CSV and rasters, merges them into an infrastructure layer, "
+            "and uploads both individual layers and the final raster to Google Earth Engine."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--year", type=int, default=date.today().year,
+        help="Target year for OSM data (e.g., 2024). \n" \
+        "Default = current (today's) year.\n" \
+        "Uses previous year's planet snapshot (looks for a file from/closest to 12/31/year-1).")
+    
+    parser.add_argument("--resolution", type=float, default=0.00269,
+        help="Output raster resolution in degrees (default = 0.00269 ≈ 300m at the equator).")
+    
     parser.add_argument("--bounds", nargs=4, type=float, metavar=("xmin", "ymin", "xmax", "ymax"),
-                        default=[-180, -90, 180, 90])
-    parser.add_argument("--max_csv_rows", type=int, default=1_000_000, help="Max rows per tag CSV shard (streaming split).")
-    parser.add_argument("--cleanup", action="store_true", help="Remove intermediate files after successful processing.")
-    parser.add_argument("--upload_merged_only", action="store_true", help="If set, upload only the merged raster to GCS and GEE instead of all tag rasters.")
+                        default=[-180, -90, 180, 90],
+        help=(
+            "Geographic bounds for rasterization in EPSG:4326.\n"
+            "Format: xmin ymin xmax ymax.\n"
+            "Default: global (-180 -90 180 90).\n"
+            "Example: --bounds -10 -56 -35 5"
+        ))
+    parser.add_argument("--max_csv_rows", type=int, default=1_000_000, 
+        help="Max rows per tag CSV shard (streaming split). Default: 1_000_000")
+    
+    parser.add_argument("--cleanup", action="store_true", 
+        help="Remove intermediate CSVs and raster files after successful processing.")
+    
+    parser.add_argument("--upload_merged_only", action="store_true", 
+        help="If set, upload only the merged raster to GCS and GEE instead of all tag rasters.")
+
     args = parser.parse_args()
 
     year = args.year
@@ -730,13 +787,14 @@ def main():
     max_rows = args.max_csv_rows
     do_cleanup = args.cleanup
     upload_merged_only = args.upload_merged_only
-
+    res_m = degrees_to_meters(res)
+    
     # Define paths and names.
     year_dir = OUTPUT_BASE_DIR / f"{year}"
     txt_dir = year_dir
     csv_dir = year_dir / "csvs"
     raster_dir = year_dir / "rasters"
-    merged_path = year_dir / f"flii_infra_{year}.tif"
+    merged_path = year_dir / f"flii_infra_{year}_{res_m}m.tif"
     pbf_path = year_dir / f"osm_{year}.osm.pbf"
 
     for d in [csv_dir, raster_dir]:
