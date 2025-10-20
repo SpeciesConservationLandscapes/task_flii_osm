@@ -839,7 +839,7 @@ def main():
 
     with log_time("[6] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
-        export_rasters_to_gee(raster_dir, year, upload_merged_only)
+        export_rasters_to_gee(raster_dir, year, res, upload_merged_only)
 
     # Optionally clean up intermediates.
     if do_cleanup:

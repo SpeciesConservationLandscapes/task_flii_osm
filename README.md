@@ -72,13 +72,41 @@ FLII_OSM/
 ```
 
 ## Example usage
+
+Run `python src/task.py --help` for a list of variables:
+
+```
+usage: python src/task.py [-h] [--year YEAR] [--resolution RESOLUTION] [--bounds xmin ymin xmax ymax] [--max_csv_rows MAX_CSV_ROWS] [--cleanup] [--upload_merged_only]
+
+Run the FLII OSM-based infrastructure pipeline.
+
+This pipeline downloads OpenStreetMap global data for the specified year, filters features based on configured tags and weights (in osm_config.json), converts them to CSV and rasters, merges them into an infrastructure layer, and uploads both individual layers and the final raster to Google Earth Engine.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --year YEAR           Target year for OSM data (e.g., 2024).
+                        Default = current (today's) year.
+                        Uses previous year's planet snapshot (looks for a file from/closest to 12/31/year-1).
+  --resolution RESOLUTION
+                        Output raster resolution in degrees (default = 0.00269 ≈ 300m at the equator).
+  --bounds xmin ymin xmax ymax
+                        Geographic bounds for rasterization in EPSG:4326.
+                        Format: xmin ymin xmax ymax.
+                        Default: global (-180 -90 180 90).
+                        Example: --bounds -10 -56 -35 5
+  --max_csv_rows MAX_CSV_ROWS
+                        Max rows per tag CSV shard (streaming split). Default: 1_000_000
+  --cleanup             Remove intermediate CSVs and raster files after successful processing.
+  --upload_merged_only  If set, upload only the merged raster to GCS and GEE instead of all tag rasters.
+```
+
+By default, the code runs for the year to date, outputs `0.00269 degrees` resolution rasters in `EPSG:4326` (`300 meters` near the Equator), and for global bounds (e.g. `-90, -180, 90, 180`). By default, all rasters (~ 135 OSM tag-level/subcategory layers + final infrastructure layer) are uploaded to GCP and GEE. These are customizable settings.
+
 To run the task:
 
 ```
 python src/task.py --upload_merged_only
 ```
-
-By default, the code runs for the year to date, outputs 0.00269 degrees resolution rasters (300 meters near the Equator), and for global bounds (e.g. -90, -180, 90, 180). These are customizable settings.
 
 If running for a specific year (not the current year), set the  `--year` flag:
 ```
@@ -90,7 +118,7 @@ If you want to upload all tag-level rasters (e.g. highway_primary.tif, power_pla
 python src/task.py --year 2024
 ```
 
-If you want to change the raster resolution, you can change the `--resolution` flag. E.g. 100 m (near the Equator):
+If you want to change the raster resolution, change `--resolution` flag. E.g. 100 m (near the Equator). Always in EPSG:4326:
 ```
 python src/task.py --year 2024 --resolution 0.0009 --upload_merged_only
 ```
