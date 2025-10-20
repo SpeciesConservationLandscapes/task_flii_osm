@@ -298,6 +298,7 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
     Optimized for global runs: filters by relevant keys only, no intermediate PBF.
     Compatible with Osmium versions that expect JSON configs.
     """
+    
     if not osm_path.exists():
         raise FileNotFoundError(f"[ERROR] OSM input file not found: {osm_path}")
 

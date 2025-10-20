@@ -14,7 +14,7 @@ It is recommended to run the FLII OSM pipeline inside a Docker container to ensu
 ## What does this task do?
 
 1. **Fetch OSM PBF file**  
-   Downloads the latest or year-specific `.osm.pbf` snapshot from official OSM mirrors.
+   Downloads the latest or year-specific `.osm.pbf` snapshot from official OSM mirrors. Stores metadata (size, URL, date) in a JSON file (`osm_download_metadata.json`) alongside the data.
 
 2. **Convert PBF file → text**  
    Uses `osmium` to convert the OSM file into a `.txt` format.
@@ -64,7 +64,8 @@ FLII_OSM/
 │     │           └── <category_subcategory>.tiff
 │     ├── flii_infra_2024.tif
 │     ├── osm_2024.osm.pbf
-│     └── osm_2024.txt
+│     ├── osm_2024.txt
+│     └── osm_download_metadata.json
 ├── .env
 ├── Dockerfile
 ├── Makefile
