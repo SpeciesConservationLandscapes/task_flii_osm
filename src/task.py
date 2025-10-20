@@ -451,6 +451,7 @@ def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,flo
     Run _rasterize_single in parallel for all CSVs using ProcessPoolExecutor.
     Produce one GeoTIFF per CSV shard in out_dir.
     """
+
     out_dir.mkdir(parents=True, exist_ok=True)
     out_tifs = [out_dir / (Path(c).stem + ".tif") for c in csvs]
     num_cpus = max(1, (os.cpu_count() or 2) - 1)
@@ -467,6 +468,7 @@ def merge_tag_shards(raster_dir: Path) -> List[Path]:
     into a single raster per tag using gdal_calc.
     Returns a list of merged tag rasters.
     """
+
     rasters = sorted(raster_dir.glob("*.tif"))
     if not rasters:
         print("[TAG MERGE] No rasters found to merge by tag.")
@@ -495,8 +497,6 @@ def merge_tag_shards(raster_dir: Path) -> List[Path]:
                     pass
     print(f"[TAG MERGE] Produced {len(merged_paths)} tag-level rasters.")
     return merged_paths
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
@@ -534,6 +534,7 @@ def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
     Runs several _calc_sum() calls concurrently and merges intermediate results
     until one final raster remains.
     """
+
     if len(inputs) == 0:
         raise ValueError("No rasters provided to _calc_sum_safe")
 
@@ -588,6 +589,7 @@ def sum_all_rasters(inputs: List[Path], out_path: Path):
     """
     Wrapper that merges all tag-level rasters into the final infrastructure raster.
     """
+
     if not inputs:
         print("[MERGE] No rasters to sum.")
         return
@@ -598,6 +600,7 @@ def upload_to_gcs(local_path: Path, gcs_uri: str):
     """
     Uses the 'gsutil' CLI to copy rasters to a GCS bucket.
     """
+
     print(f"[UPLOAD] {local_path.name} → {gcs_uri}")
     gsutil_path = shutil.which("gsutil") or shutil.which("gsutil.cmd") or shutil.which("gsutil.CMD")
     if gsutil_path is None:
@@ -614,6 +617,7 @@ def ensure_ee_folder_exists(folder_path: str):
     """
     Ensure a GEE folder exists before uploading assets into it.
     """
+
     try:
         ee.data.getAsset(folder_path)
         print(f"[EE FOLDER] Exists: {folder_path}")
@@ -632,6 +636,7 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
     to ingest the raster as an asset.
     Uses the GEE REST ingestion API (ee.data.startIngestion).
     """
+
     print(f"[EE IMPORT] {gcs_uri} → {asset_id}")
     try:
         folder_path = "/".join(asset_id.split("/")[:-1])
@@ -665,9 +670,11 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
 
 def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
+    Upload rasters to GCS and GEE.
     If upload_merged_only=True, uploads only the merged final raster (infrastucture layer).
-    Otherwise, uploads all per-tag rasters plus the merged one.
+    Otherwise, upload. all per-tag rasters plus the merged one.
     Each uploaded raster is registered as a new GEE asset.
+    The OSM download metadata file is also uploaded to GCS.
     """
 
     print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
@@ -729,11 +736,24 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
 
     print(f"Export summary saved: {gcs_metadata_uri}")
 
+    # OSM metadata file.
+    osm_meta_path = raster_dir.parent / "osm_download_metadata.json"
+    if osm_meta_path.exists():
+        osm_gcs_uri = f"gs://{GCS_BUCKET}/{year}/osm_download_metadata.json"
+        try:
+            subprocess.run(["gsutil", "cp", str(osm_meta_path), osm_gcs_uri], check=True)
+            print(f"[METADATA] Uploaded OSM metadata to GCS: {osm_gcs_uri}")
+        except subprocess.CalledProcessError as e:
+            print(f"[WARN] Could not upload OSM metadata to GCS: {e}")
+    else:
+        print("[WARN] No OSM metadata file found to upload.")
+
 def cleanup_intermediates(year_dir: Path):
     """
     After a successful run, this removes large intermediate files (CSV shards,
     temporary merge rasters, etc.) to save disk space.
     """
+
     print(f"[CLEANUP] Removing intermediates in {year_dir}")
     for sub in ["csvs", "rasters/_tmp_merge"]:
         p = year_dir / sub
