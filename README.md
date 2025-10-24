@@ -45,7 +45,7 @@ Refer to [`.env.example`](/.env.example) to setup your env locally.
 ## Structure
 
 ```text
-FLII_OSM/
+task_flii_osm/
 │
 ├── src/
 │     ├── task.py
@@ -56,16 +56,16 @@ FLII_OSM/
 │     ├── 2021/
 │     ├── 2022/
 │     ├── 2023/
-│     ├── 2024/
-│     │     ├── csvs/
-│     │     │     └── <category=subcategory>.csv
-│     │     └── rasters/
-│     │           ├── gee_export_metadata_2024.json
-│     │           └── <category_subcategory>.tiff
-│     ├── flii_infra_2024.tif
-│     ├── osm_2024.osm.pbf
-│     ├── osm_2024.txt
-│     └── osm_download_metadata.json
+│     └── 2024/
+│           ├── csvs/
+│           │     └── <category=subcategory>.csv
+│           ├── rasters/
+│           │     ├── gee_export_metadata_2024.json
+│           │     └── <category_subcategory>.tiff
+│           ├── flii_infra_2024.tif
+│           ├── osm_2024.osm.pbf
+│           ├── osm_2024.txt
+│           └── osm_download_metadata.json
 ├── .env
 ├── Dockerfile
 ├── Makefile
