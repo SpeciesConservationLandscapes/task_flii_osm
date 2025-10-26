@@ -320,22 +320,37 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
 
     cmd = [
         "osmium", "export",
+        "--progress",
         "--overwrite",
-        "--omit-rs",          # omit relation skeletons for speed.
         "-c", str(cfg_path),  # JSON config file.
         "-f", "text",
         "-o", str(out_path),
         str(osm_path)
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"[ERROR] Osmium export failed:\n{result.stderr}")
-        raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
+    # Run with real-time stderr streaming
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1  # line-buffered for live updates
+    )
+
+    # Stream stderr (progress + logs)
+    for line in process.stderr:
+        print(line, end="")
+
+    # Wait for completion
+    stdout, stderr = process.communicate()
+
+    if process.returncode != 0:
+        print(f"[ERROR] Osmium export failed:\n{stderr}")
+        raise subprocess.CalledProcessError(process.returncode, cmd, stderr)
 
     print(f"[DONE] Export complete → {out_path}")
 
-    # Clean up config file
+    # Clean up
     try:
         cfg_path.unlink()
     except Exception:
