@@ -319,6 +319,7 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
     print(", ".join(keys[:10]) + ("..." if len(keys) > 10 else ""))
 
     cmd = [
+        "stdbuf", "-oL", "-eL",
         "osmium", "export",
         "--progress",
         "--overwrite",
