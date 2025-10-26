@@ -1,7 +1,7 @@
 FROM debian:bullseye-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends osmium-tool python3 python3-pip git python3-gdal gdal-bin curl apt-transport-https ca-certificates gnupg wget && \
+    apt-get install -y --no-install-recommends osmium-tool python3 python3-pip git python3-gdal gdal-bin curl apt-transport-https ca-certificates gnupg wget coreutils && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
       | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
