@@ -316,42 +316,50 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
 
     print(f"[OSMIUM] Exporting {osm_path.name} → {out_path}")
     print(f"[OSMIUM] Generated JSON filter config for {len(keys)} keys:")
-    print(", ".join(keys[:10]) + ("..." if len(keys) > 10 else ""))
+    print(", ".join(keys[:20]) + ("..." if len(keys) > 20 else ""))
 
     cmd = [
-        "stdbuf", "-oL", "-eL",
         "osmium", "export",
         "--progress",
         "--overwrite",
-        "-c", str(cfg_path),  # JSON config file.
+        "-c", str(cfg_path),
         "-f", "text",
         "-o", str(out_path),
         str(osm_path)
     ]
 
-    # Run with real-time stderr streaming
+    # Use stdbuf for unbuffered output if available
+    if shutil.which("stdbuf"):
+        cmd = ["stdbuf", "-oL", "-eL"] + cmd
+
+    # Force progress even in non-TTY Docker environments
+    env = os.environ.copy()
+    env["OSMIUM_SHOW_PROGRESS"] = "1"
+
+    # Run and stream live progress (handles both \r and \n)
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        bufsize=1  # line-buffered for live updates
+        bufsize=0,
+        env=env
     )
 
-    # Stream stderr (progress + logs)
-    for line in process.stderr:
-        print(line, end="")
+    while True:
+        chunk = process.stderr.read(1)
+        if not chunk:
+            break
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
 
-    # Wait for completion
-    stdout, stderr = process.communicate()
+    process.wait()
 
     if process.returncode != 0:
-        print(f"[ERROR] Osmium export failed:\n{stderr}")
-        raise subprocess.CalledProcessError(process.returncode, cmd, stderr)
+        raise subprocess.CalledProcessError(process.returncode, cmd)
 
     print(f"[DONE] Export complete → {out_path}")
 
-    # Clean up
     try:
         cfg_path.unlink()
     except Exception:
