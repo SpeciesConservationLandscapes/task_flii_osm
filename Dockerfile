@@ -1,5 +1,7 @@
 FROM debian:bookworm-slim
 
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         osmium-tool \
