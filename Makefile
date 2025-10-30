@@ -6,14 +6,14 @@ build:
 
 run:
 	docker run --env-file=.env \
-		-v ./flii_outputs:/flii_outputs \
+		-v ./flii_outputs:/app/flii_outputs \
 		-v ./src:/app/src \
 		-it --name $(CONTAINER_NAME) \
 		--entrypoint python $(IMAGE) src/task.py --skip_cleanup
 
 shell:
 	docker run --env-file=.env \
-		-v ./flii_outputs:/flii_outputs \
+		-v ./flii_outputs:/app/flii_outputs \
 		-v ./src:/app/src \
 		-it --name $(CONTAINER_NAME) \
 		--entrypoint bash $(IMAGE)
