@@ -1,21 +1,20 @@
 IMAGE = flii_osm
 CONTAINER_NAME = flii_osm_run
-WORKDIR = $(shell pwd)
 
 build:
 	docker build --no-cache -t $(IMAGE) .
 
 run:
-	docker run --env-file=$(WORKDIR)/.env \
-		-v $(WORKDIR)/flii_outputs:/flii_outputs \
-		-v $(WORKDIR)/src:/app/src \
+	docker run --env-file=.env \
+		-v ./flii_outputs:/flii_outputs \
+		-v ./src:/app/src \
 		-it --name $(CONTAINER_NAME) \
 		--entrypoint python $(IMAGE) src/task.py --skip_cleanup
 
 shell:
-	docker run --env-file=$(WORKDIR)/.env \
-		-v $(WORKDIR)/flii_outputs:/flii_outputs \
-		-v $(WORKDIR)/src:/app/src \
+	docker run --env-file=.env \
+		-v ./flii_outputs:/flii_outputs \
+		-v ./src:/app/src \
 		-it --name $(CONTAINER_NAME) \
 		--entrypoint bash $(IMAGE)
 
