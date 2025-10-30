@@ -31,8 +31,6 @@ gdal.UseExceptions()
 gdal.SetConfigOption("GDAL_CACHEMAX", "512")
 gdal.SetConfigOption("GDAL_SWATH_SIZE", "512")
 gdal.SetConfigOption("GDAL_MAX_DATASET_POOL_SIZE", "400")
-os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
-os.environ["NUMEXPR_MAX_THREADS"] = str(os.cpu_count())
 
 # ----------------------
 # DIRECTORY / OSM CONFIG
@@ -478,11 +476,19 @@ def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,flo
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_tifs = [out_dir / (Path(c).stem + ".tif") for c in csvs]
-    num_cpus = max(1, (os.cpu_count() or 2) - 1)
-    print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers...")
+    num_cpus = max(1, (os.cpu_count() // 4) or 1)
+    os.environ["GDAL_NUM_THREADS"] = "2"
+    print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers (2 threads each)...")
 
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        list(exe.map(_rasterize_single, csvs, out_tifs, itertools.repeat(bounds), itertools.repeat(res)))
+        futures = [exe.submit(_rasterize_single, c, o, bounds, res)
+                   for c, o in zip(csvs, out_tifs)]
+        for i, f in enumerate(as_completed(futures), 1):
+            try:
+                f.result()
+                print(f"[RASTERIZE] Completed {i}/{len(csvs)}")
+            except Exception as e:
+                print(f"[RASTERIZE] Failed on {i}/{len(csvs)}: {e}")
 
     return out_tifs
 
