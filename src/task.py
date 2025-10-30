@@ -26,6 +26,7 @@ import itertools
 # ------------
 # GDAL CONFIG 
 # ------------
+
 gdal.UseExceptions()
 gdal.SetConfigOption("GDAL_CACHEMAX", "512")
 gdal.SetConfigOption("GDAL_SWATH_SIZE", "512")
@@ -63,6 +64,7 @@ def log_time(label: str):
     It prints the elapsed time when the block ends.
     Used in the 'main' function.
     """
+    
     start = time.time()
     print(f"[TIMER] Starting: {label}")
     try:
@@ -156,9 +158,6 @@ def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]
     For example, if task_year=2024, it searches around 2023-12-31.
     It checks multiple known mirror URLs.
     """
-
-    import requests
-    from datetime import datetime, timedelta
 
     taskdate = datetime(task_year - 1, 12, 31)
 
@@ -528,7 +527,7 @@ def _calc_sum(inputs: List[Path], out_path: Path):
     Sum ≤26 (limit) rasters safely (A+B+...).
     Unsets NoData on all inputs and output to avoid propagation.
     """
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" # 26.
+    
     if len(inputs) == 0:
         raise ValueError("No rasters provided to _calc_sum")
     if len(inputs) > 26:
@@ -555,7 +554,7 @@ def _calc_sum(inputs: List[Path], out_path: Path):
 
 def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
     """
-    Handles cases with more than 26 rasters by merging them in chunks in parallel.
+    Handles cases with more than 26 rasters by merging them in parallel chunks.
     Runs several _calc_sum() calls concurrently and merges intermediate results
     until one final raster remains.
     """
@@ -696,8 +695,8 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
 def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
     Upload rasters to GCS and GEE.
-    If upload_merged_only=True, uploads only the merged final raster (infrastucture layer).
-    Otherwise, upload. all per-tag rasters plus the merged one.
+    If upload_merged_only=True, uploads only the merged final raster (infrastructure layer).
+    Otherwise, uploads all per-tag rasters plus the merged one.
     Each uploaded raster is registered as a new GEE asset.
     The OSM download metadata file is also uploaded to GCS.
     """
