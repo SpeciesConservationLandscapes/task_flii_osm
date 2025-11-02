@@ -553,6 +553,7 @@ def _calc_sum(inputs: List[Path], out_path: Path):
         f"--outfile={str(out_path)}",
         "--type=Int16",
         "--co=COMPRESS=LZW",
+        "--co=BIGTIFF=YES",
         "--calc", calc_expr
     ]
     for i, r in enumerate(inputs):
