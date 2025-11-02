@@ -22,13 +22,14 @@ from contextlib import contextmanager
 import math
 from tqdm import tqdm
 import itertools
+import multiprocessing
 
 # ------------
 # GDAL CONFIG 
 # ------------
 
 gdal.UseExceptions()
-gdal.SetConfigOption("GDAL_CACHEMAX", "2048") # 2 GB global cache
+gdal.SetConfigOption("GDAL_CACHEMAX", "8192") # 8 GB global cache
 gdal.SetConfigOption("GDAL_SWATH_SIZE", "10485760") # 10 MB
 gdal.SetConfigOption("GDAL_MAX_DATASET_POOL_SIZE", "400")
 os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
@@ -443,7 +444,6 @@ def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
     Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Int16 GeoTIFF.
     """
 
-    os.environ["GDAL_NUM_THREADS"] = "2"
     res_m = degrees_to_meters(res)
     out_tif = Path(out_tif)
     out_tif = out_tif.with_name(f"{out_tif.stem}_{res_m}m.tif")
@@ -480,7 +480,7 @@ def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,flo
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_tifs = [out_dir / (Path(c).stem + ".tif") for c in csvs]
-    num_cpus = max(1, min(8, (os.cpu_count() // 4)))
+    num_cpus = multiprocessing.cpu_count() - 1 or 1
     print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers...")
 
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
