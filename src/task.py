@@ -548,17 +548,38 @@ def _calc_sum(inputs: List[Path], out_path: Path):
 
     calc_expr = " + ".join([f"nan_to_num({chr(65+i)})" for i in range(len(inputs))])
 
+    if out_path.exists():
+        out_path.unlink()
+
+    # Create an empty BigTIFF container explicitly so the driver uses 64-bit offsets
+    src_ds = gdal.Open(str(inputs[0]))
+    driver = gdal.GetDriverByName("GTiff")
+    tmp_ds = driver.CreateCopy(
+        str(out_path), src_ds, 0,
+        options=[
+            "TILED=YES",
+            "BLOCKXSIZE=1024",
+            "BLOCKYSIZE=1024",
+            "COMPRESS=LZW",
+            "BIGTIFF=YES",
+        ]
+    )
+    tmp_ds = None 
+
     args = [
         "gdal_calc.py", "--quiet", "--overwrite",
         f"--outfile={str(out_path)}",
         "--type=Int16",
+        "--calc", calc_expr,
         "--co=COMPRESS=LZW",
         "--co=BIGTIFF=YES",
-        "--calc", calc_expr
     ]
     for i, r in enumerate(inputs):
         args.extend([f"-{chr(65+i)}", str(r)])
+
     subprocess.run(args, check=True)
+
+    # Remove any NoData flag on output to ensure valid numeric sum
     subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
 
 
