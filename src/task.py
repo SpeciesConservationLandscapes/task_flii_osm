@@ -441,7 +441,7 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
 def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
                       bounds: Tuple[float,float,float,float], res: float):
     """
-    Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Int16 GeoTIFF.
+    Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Byte GeoTIFF.
     """
 
     res_m = degrees_to_meters(res)
@@ -450,7 +450,7 @@ def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
 
     opts = gdal.RasterizeOptions(
         format="GTiff",
-        outputType=gdalconst.GDT_Int16,
+        outputType=gdalconst.GDT_Byte,
         initValues=0,
         burnValues=None, # read from attribute
         attribute="BURN",
@@ -569,7 +569,7 @@ def _calc_sum(inputs: List[Path], out_path: Path):
     args = [
         "gdal_calc.py", "--quiet", "--overwrite",
         f"--outfile={str(out_path)}",
-        "--type=Int16",
+        "--type=Byte",
         "--calc", calc_expr,
         "--co=COMPRESS=LZW",
         "--co=BIGTIFF=YES",
