@@ -29,12 +29,11 @@ import multiprocessing
 # ------------
 
 gdal.UseExceptions()
-gdal.SetConfigOption("GDAL_CACHEMAX", "8192") # 8 GB global cache
-gdal.SetConfigOption("GDAL_SWATH_SIZE", "10485760") # 10 MB
+gdal.SetConfigOption("GDAL_CACHEMAX", "4096")  
+gdal.SetConfigOption("GDAL_SWATH_SIZE", "1048576")  
 gdal.SetConfigOption("GDAL_MAX_DATASET_POOL_SIZE", "400")
 os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
-os.environ["VSI_CACHE"] = "TRUE" 
-os.environ["VSI_CACHE_SIZE"] = "1000000000"  # 1 GB cache for virtual I/O
+os.environ["VSI_CACHE"] = "FALSE" 
 
 # ----------------------
 # DIRECTORY / OSM CONFIG
@@ -380,54 +379,81 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     """
     
     os.makedirs(csv_dir, exist_ok=True)
-    target_tags = set(config.keys())  # e.g., {"highway=primary": 9, ...}
+    txt_file = Path(txt_file)
+    csv_dir = Path(csv_dir)
+
+    # Build config lookup for fast membership check
+    config_index = defaultdict(set)
+    for kv in config.keys():
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        config_index[k].add(v)
+
     tag_files: Dict[str, csv.writer] = {}
     tag_fhandles: Dict[str, any] = {}
     tag_shard_counts: Dict[str, int] = defaultdict(int)
     tag_row_counts: Dict[str, int] = defaultdict(int)
-
     out_paths: List[Path] = []
+
+    geom_prefixes = (
+        "POINT(", "MULTIPOINT(", "LINESTRING(", "MULTILINESTRING(",
+        "POLYGON(", "MULTIPOLYGON(", "GEOMETRYCOLLECTION("
+    )
+
+    # Super-tolerant regex for key=value pairs
+    tag_pattern = re.compile(
+        r'@?"?([\w:\-]+)"?\s*=\s*"?([\w\.\-:/%]+)"?',
+        flags=re.UNICODE
+    )
 
     with open(txt_file, "r", encoding="utf-8") as f:
         for line in f:
-            if not line.startswith("POINT(") and not line.startswith("LINESTRING(") and not line.startswith("POLYGON("):
+            if not line.startswith(geom_prefixes):
                 continue
 
-            geom_match = re.match(r'^(POINT|LINESTRING|POLYGON)\((.+)\)', line)
-            if not geom_match:
+            try:
+                wkt_end = line.index(")") + 1
+            except ValueError:
                 continue
-            wkt_end = line.index(")") + 1
+
             wkt = line[:wkt_end]
+            tags_str = line[wkt_end:].strip()
 
-            # Tags after geometry
-            tags_str = line[wkt_end:]
-            tags = dict(re.findall(r'@?([\w\:\-]+)=([\w\-\.\%\:/]+)', tags_str))
+            # Extract all key=value pairs (robust regex)
+            tags = {}
+            for k, v in tag_pattern.findall(tags_str):
+                tags[k.strip("@")] = v
 
-            for tag_val in target_tags:
-                if "=" not in tag_val:
+            # If nothing found, skip
+            if not tags:
+                continue
+
+            # Process valid matches
+            for tag, val in tags.items():
+                if tag not in config_index or val not in config_index[tag]:
                     continue
-                tag, val = tag_val.split("=", 1)
-                if tags.get(tag) == val:
-                    # open/rollover shard if needed
-                    if (tag_val not in tag_files) or (tag_row_counts[tag_val] >= max_rows):
-                        if tag_val in tag_fhandles:
-                            tag_fhandles[tag_val].close()
-                        safe = tag_val.replace(":", "_").replace("/", "_").replace("=", "_")
-                        shard_idx = tag_shard_counts[tag_val] + 1
-                        out_path = Path(csv_dir) / f"{safe}_{shard_idx:03d}.csv"
-                        fh = open(out_path, "w", newline="", encoding="utf-8")
-                        writer = csv.writer(fh)
-                        writer.writerow(["WKT", "BURN"])
-                        tag_files[tag_val] = writer
-                        tag_fhandles[tag_val] = fh
-                        tag_shard_counts[tag_val] = shard_idx
-                        tag_row_counts[tag_val] = 0
-                        out_paths.append(out_path)
+                tag_val = f"{tag}={val}"
+                burn = config[tag_val]
 
-                    # Bake the weight here.
-                    burn = int(config[tag_val])
-                    tag_files[tag_val].writerow([wkt, burn])
-                    tag_row_counts[tag_val] += 1
+                # Rotate shard if full
+                if (tag_val not in tag_files) or (tag_row_counts[tag_val] >= max_rows):
+                    if tag_val in tag_fhandles:
+                        tag_fhandles[tag_val].close()
+                    safe = tag_val.replace(":", "_").replace("/", "_")
+                    shard_idx = tag_shard_counts[tag_val] + 1
+                    out_path = csv_dir / f"{safe}_{shard_idx:03d}.csv"
+                    fh = open(out_path, "w", newline="", encoding="utf-8")
+                    writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
+                    writer.writerow(["WKT", "BURN"])
+                    tag_files[tag_val] = writer
+                    tag_fhandles[tag_val] = fh
+                    tag_shard_counts[tag_val] = shard_idx
+                    tag_row_counts[tag_val] = 0
+                    out_paths.append(out_path)
+
+                tag_files[tag_val].writerow([wkt, burn])
+                tag_row_counts[tag_val] += 1
 
     for fh in tag_fhandles.values():
         try:
@@ -435,25 +461,43 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
         except:
             pass
 
-    print(f"[SPLIT] {txt_file} → {len(out_paths)} CSV shards")
+    print(f"[SPLIT] {txt_file.name} → {len(out_paths)} CSV shards written to {csv_dir}")
     return out_paths
 
-def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
-                      bounds: Tuple[float,float,float,float], res: float):
-    """
-    Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Byte GeoTIFF.
-    """
+def _infer_burn_from_csv(csv_path: Path, default: int = 1) -> int:
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            row = next(reader, None)
+            if row is None:
+                return default
+            return int(float(row.get("BURN", default)))
+    except Exception:
+        return default
 
-    res_m = degrees_to_meters(res)
+
+def _rasterize_single_fast(
+    in_csv: Union[str, Path],
+    out_tif: Union[str, Path],
+    bounds: Tuple[float, float, float, float],
+    res: float,
+    burn_value: int
+):
+    """
+    Extremely fast rasterization of 2-column CSV (WKT,BURN).
+    Uses constant burn values (already known per CSV/tag),
+    writes uncompressed tiled GeoTIFF for maximum throughput.
+    """
     out_tif = Path(out_tif)
-    out_tif = out_tif.with_name(f"{out_tif.stem}_{res_m}m.tif")
+    out_tif.parent.mkdir(parents=True, exist_ok=True)
 
     opts = gdal.RasterizeOptions(
         format="GTiff",
         outputType=gdalconst.GDT_Byte,
+        noData=0,
         initValues=0,
-        burnValues=None, # read from attribute
-        attribute="BURN",
+        burnValues=[burn_value],  
+        attribute=None,
         xRes=res,
         yRes=res,
         targetAlignedPixels=True,
@@ -463,73 +507,97 @@ def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
             "TILED=YES",
             "BLOCKXSIZE=1024",
             "BLOCKYSIZE=1024",
-            "COMPRESS=LZW",
+            "COMPRESS=NONE", 
+            "BIGTIFF=YES",
         ],
     )
-    # Ensure directory
-    Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
-    # Rasterize
     gdal.Rasterize(str(out_tif), str(in_csv), options=opts)
-    return Path(out_tif)
+    return out_tif
 
-def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,float,float], res: float) -> List[Path]:
-    """
-    Run _rasterize_single in parallel for all CSVs using ProcessPoolExecutor.
-    Produce one GeoTIFF per CSV shard in out_dir.
-    """
 
+def rasterize_all_fast(
+    csvs: List[Path],
+    out_dir: Path,
+    bounds: Tuple[float, float, float, float],
+    res: float,
+    config: dict
+) -> List[Path]:
+    """
+    Rasterize all tag CSVs in parallel using constant burn values.
+    Infers burn value from config dict (tag=value).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_tifs = [out_dir / (Path(c).stem + ".tif") for c in csvs]
-    num_cpus = multiprocessing.cpu_count() - 1 or 1
-    print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers...")
+    num_cpus = max(1, multiprocessing.cpu_count() - 1)
+    print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers (uncompressed, constant burn)...")
 
+    out_tifs = []
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        futures = [exe.submit(_rasterize_single, c, o, bounds, res)
-                   for c, o in zip(csvs, out_tifs)]
+        futures = {}
+        for csv_path in csvs:
+            burn_value = _infer_burn_from_csv(csv_path, default=1)
+            out_tif = out_dir / f"{csv_path.stem}.tif"
+            fut = exe.submit(_rasterize_single_fast, csv_path, out_tif, bounds, res, burn_value)
+            futures[fut] = out_tif
+
         for i, f in enumerate(as_completed(futures), 1):
+            out_path = futures[f]
             try:
                 f.result()
-                print(f"[RASTERIZE] Completed {i}/{len(csvs)}")
+                out_tifs.append(out_path)
+                if i % 10 == 0 or i == len(futures):
+                    print(f"[RASTERIZE] Completed {i}/{len(futures)}")
             except Exception as e:
-                print(f"[RASTERIZE] Failed on {i}/{len(csvs)}: {e}")
+                print(f"[RASTERIZE] Failed on {out_path.name}: {e}")
 
     return out_tifs
 
-def merge_tag_shards(raster_dir: Path) -> List[Path]:
+def merge_tag_shards_fast(raster_dir: Path) -> List[Path]:
     """
-    Merge all tag-level shard rasters (e.g., highway_residential_001, _002)
-    into a single raster per tag using gdal_calc.
-    Returns a list of merged tag rasters.
+    Merge tag-level shards (e.g., highway_residential_001, _002)
+    into a single raster per tag.  Uses gdalbuildvrt + gdal_calc
+    but with fewer I/O passes.
     """
-
     rasters = sorted(raster_dir.glob("*.tif"))
     if not rasters:
-        print("[TAG MERGE] No rasters found to merge by tag.")
+        print("[MERGE] No rasters found.")
         return []
 
-    tag_groups: Dict[str, List[Path]] = defaultdict(list)
+    tag_groups = defaultdict(list)
     for r in rasters:
-        base = re.sub(r"_[0-9]{3}$", "", r.stem)  # strip trailing _001 etc.
+        base = re.sub(r"_[0-9]{3}$", "", r.stem)
         tag_groups[base].append(r)
 
-    merged_paths: List[Path] = []
+    merged_paths = []
     for base, group in tag_groups.items():
         if len(group) == 1:
             merged_paths.append(group[0])
             continue
-        print(f"[TAG MERGE] Merging {len(group)} shards for tag: {base}")
+
         out_path = raster_dir / f"{base}.tif"
-        _calc_sum(group, out_path)
+        tmp_vrt = raster_dir / f"{base}_tmp.vrt"
+        print(f"[MERGE] Merging {len(group)} shards → {out_path.name}")
+
+        # 1. Build virtual stack
+        subprocess.run(["gdalbuildvrt", "-separate", str(tmp_vrt)] + [str(p) for p in group], check=True)
+        # 2. Sum all bands directly
+        expr = " + ".join([chr(65 + i) for i in range(len(group))])
+        args = [
+            "gdal_calc.py", "--quiet", "--overwrite",
+            f"--outfile={str(out_path)}",
+            "--calc", expr,
+            "--type=Byte",
+            "--co=COMPRESS=NONE",
+            "--co=BIGTIFF=YES",
+        ]
+        for i, p in enumerate(group):
+            args.extend([f"-{chr(65+i)}", str(p)])
+        subprocess.run(args, check=True)
+        tmp_vrt.unlink(missing_ok=True)
         merged_paths.append(out_path)
-        # optional cleanup
-        for g in group:
-            if g != out_path:
-                try:
-                    g.unlink()
-                except:
-                    pass
-    print(f"[TAG MERGE] Produced {len(merged_paths)} tag-level rasters.")
+
+    print(f"[MERGE] Produced {len(merged_paths)} merged rasters.")
     return merged_paths
+
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
@@ -707,21 +775,28 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
         res_match = re.search(r"_(\d{2,4})m", asset_id)
         res_m = int(res_match.group(1)) if res_match else None
 
+        # Build properties safely
+        props = {}
+        year_match = re.search(r"/(\d{4})/", asset_id)
+        if year_match:
+            props["year"] = int(year_match.group(1))
+        if res_m is not None:
+            props["resolution_m"] = int(res_m)
+
         params = {
-            'id': asset_id,
-            'tilesets': [{'sources': [{'uris': [gcs_uri]}]}],
-            'bands': [{'id': 'b1'}],
-            'pyramidingPolicy': 'MEAN',
-            'properties': {
-                'year': int(re.search(r"/(\d{4})/", asset_id).group(1)) if re.search(r"/(\d{4})/", asset_id) else None,
-                'resolution_m': res_m
-            }
+            "id": asset_id,
+            "tilesets": [{"sources": [{"uris": [gcs_uri]}]}],
+            "bands": [{"id": "b1"}],
+            "pyramidingPolicy": "MEAN",
+            "properties": props
         }
+
         task = ee.data.startIngestion(str(uuid.uuid4()), params)
         print(f"[EE IMPORT] Ingestion task started: {task['id']}")
     except Exception as e:
         print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
         raise
+
 
 def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
@@ -906,10 +981,11 @@ def main():
         if not csv_files:
             print("[WARN] No CSV files to rasterize.")
         else:
-            rasters = rasterize_all(csv_files, raster_dir, bounds, res)
+            rasters = rasterize_all_fast(csv_files, raster_dir, bounds, res, categories) 
+
 
     with log_time("[5] Merge all rasters"):
-        tag_rasters = merge_tag_shards(raster_dir)
+        tag_rasters = merge_tag_shards_fast(raster_dir)
         sum_all_rasters(tag_rasters, merged_path)
 
     with log_time("[6] Initialize Earth Engine + export rasters"):
