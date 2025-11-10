@@ -619,21 +619,6 @@ def _calc_sum(inputs: List[Path], out_path: Path):
     if out_path.exists():
         out_path.unlink()
 
-    # Create an empty BigTIFF container explicitly so the driver uses 64-bit offsets
-    src_ds = gdal.Open(str(inputs[0]))
-    driver = gdal.GetDriverByName("GTiff")
-    tmp_ds = driver.CreateCopy(
-        str(out_path), src_ds, 0,
-        options=[
-            "TILED=YES",
-            "BLOCKXSIZE=1024",
-            "BLOCKYSIZE=1024",
-            "COMPRESS=LZW",
-            "BIGTIFF=YES",
-        ]
-    )
-    tmp_ds = None 
-
     args = [
         "gdal_calc.py", "--quiet", "--overwrite",
         f"--outfile={str(out_path)}",
