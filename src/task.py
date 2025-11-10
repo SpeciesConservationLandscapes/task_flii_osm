@@ -475,6 +475,28 @@ def _infer_burn_from_csv(csv_path: Path, default: int = 1) -> int:
     except Exception:
         return default
 
+def generate_global_tiles(bounds=(-180, -90, 180, 90), step=30):
+    """
+    Generate a list of (xmin, ymin, xmax, ymax) tiles covering the global extent.
+    The 'step' defines the tile size in degrees (e.g., 10, 20, 30).
+    Each tile will be aligned on whole degree boundaries for consistency.
+    """
+    xmin, ymin, xmax, ymax = bounds
+    tiles = []
+    x = xmin
+    while x < xmax:
+        y = ymin
+        while y < ymax:
+            tiles.append((
+                x,
+                y,
+                min(x + step, xmax),
+                min(y + step, ymax)
+            ))
+            y += step
+        x += step
+    return tiles
+
 
 def _rasterize_single_fast(
     in_csv: Union[str, Path],
@@ -535,7 +557,8 @@ def rasterize_all_fast(
         futures = {}
         for csv_path in csvs:
             burn_value = _infer_burn_from_csv(csv_path, default=1)
-            out_tif = out_dir / f"{csv_path.stem}.tif"
+            safe_stem = re.sub(r"[=:/@]", "_", csv_path.stem)
+            out_tif = out_dir / f"{safe_stem}.tif"
             fut = exe.submit(_rasterize_single_fast, csv_path, out_tif, bounds, res, burn_value)
             futures[fut] = out_tif
 
@@ -573,8 +596,10 @@ def merge_tag_shards_fast(raster_dir: Path) -> List[Path]:
             merged_paths.append(group[0])
             continue
 
-        out_path = raster_dir / f"{base}.tif"
-        tmp_vrt = raster_dir / f"{base}_tmp.vrt"
+        safe_base = re.sub(r"[=:/@]", "_", base)
+        out_path = raster_dir / f"{safe_base}.tif"
+        tmp_vrt = raster_dir / f"{safe_base}_tmp.vrt"
+
         print(f"[MERGE] Merging {len(group)} shards → {out_path.name}")
 
         # 1. Build virtual stack
@@ -624,7 +649,7 @@ def _calc_sum(inputs: List[Path], out_path: Path):
         f"--outfile={str(out_path)}",
         "--type=Byte",
         "--calc", calc_expr,
-        "--co=COMPRESS=LZW",
+        "--co=COMPRESS=NONE",
         "--co=BIGTIFF=YES",
     ]
     for i, r in enumerate(inputs):
@@ -961,17 +986,48 @@ def main():
         else:
             split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
 
-    with log_time("[4] Rasterize CSVs (parallel)"):
+    with log_time("[4] Rasterize CSVs by tile (parallel within tiles)"):
         csv_files = list(csv_dir.glob("*.csv"))
         if not csv_files:
             print("[WARN] No CSV files to rasterize.")
         else:
-            rasters = rasterize_all_fast(csv_files, raster_dir, bounds, res, categories) 
+            # Generate spatial tiles
+            tile_size = 30  # degrees (change to 10 or 20 for finer tiling)
+            tiles = generate_global_tiles(bounds, step=tile_size)
+            print(f"[RASTERIZE] Splitting world into {len(tiles)} tiles of {tile_size}°×{tile_size}°")
 
+            tile_outputs = []
+            for i, tile_bounds in enumerate(tiles, 1):
+                print(f"[TILE {i}/{len(tiles)}] Processing bounds {tile_bounds}")
+                tile_dir = raster_dir / f"tile_{i:03d}"
+                tile_dir.mkdir(parents=True, exist_ok=True)
 
-    with log_time("[5] Merge all rasters"):
-        tag_rasters = merge_tag_shards_fast(raster_dir)
-        sum_all_rasters(tag_rasters, merged_path)
+                try:
+                    rasters = rasterize_all_fast(csv_files, tile_dir, tile_bounds, res, categories)
+                    tag_rasters = merge_tag_shards_fast(tile_dir)
+                    tile_out = tile_dir / f"infra_tile_{i:03d}.tif"
+                    sum_all_rasters(tag_rasters, tile_out)
+                    tile_outputs.append(tile_out)
+                    print(f"[TILE {i}] Completed and saved to {tile_out.name}")
+                except Exception as e:
+                    print(f"[TILE {i}] Failed: {e}")
+
+    with log_time("[5] Merge all tile rasters into global layer"):
+        tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
+        if not tile_outputs:
+            print("[WARN] No tile rasters found for merging.")
+        else:
+            print(f"[MERGE] Combining {len(tile_outputs)} tile rasters → {merged_path.name}")
+            subprocess.run([
+                "gdal_merge.py", "-o", str(merged_path),
+                "-of", "GTiff",
+                "-co", "TILED=YES",
+                "-co", "BLOCKXSIZE=1024",
+                "-co", "BLOCKYSIZE=1024",
+                "-co", "COMPRESS=LZW",
+                "-co", "BIGTIFF=YES"
+            ] + [str(t) for t in tile_outputs], check=True)
+            print(f"[MERGE] Global raster created: {merged_path}")
 
     with log_time("[6] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()

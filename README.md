@@ -62,7 +62,7 @@ task_flii_osm/
 │           ├── rasters/
 │           │     ├── gee_export_metadata_2024.json
 │           │     └── <category_subcategory>.tiff
-│           ├── flii_infra_2024.tif
+│           ├── flii_infra_2024_300m.tif
 │           ├── osm_2024.osm.pbf
 │           ├── osm_2024.txt
 │           └── osm_download_metadata.json
