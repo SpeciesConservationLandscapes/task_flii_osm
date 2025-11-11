@@ -464,17 +464,6 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     print(f"[SPLIT] {txt_file.name} → {len(out_paths)} CSV shards written to {csv_dir}")
     return out_paths
 
-def _infer_burn_from_csv(csv_path: Path, default: int = 1) -> int:
-    try:
-        with open(csv_path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            row = next(reader, None)
-            if row is None:
-                return default
-            return int(float(row.get("BURN", default)))
-    except Exception:
-        return default
-
 def generate_global_tiles(bounds=(-180, -90, 180, 90), step=30):
     """
     Generate a list of (xmin, ymin, xmax, ymax) tiles covering the global extent.
@@ -496,6 +485,70 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=30):
             y += step
         x += step
     return tiles
+
+
+def _rasterize_tag_group(
+    tag: str,
+    shard_csvs: List[Path],
+    out_dir: Path,
+    bounds: Tuple[float, float, float, float],
+    res: float
+) -> Optional[Path]:
+    """
+    Rasterize all CSV shards for a tag into one .tif for the given tile.
+
+    Each CSV contains 'WKT' and 'BURN' fields. The BURN value is rasterized as pixel intensity.
+    This function merges multiple CSV shards for the same tag into one raster per tile.
+    """
+    try:
+        safe_tag = re.sub(r"[=:/@]", "_", tag)
+        out_tif = out_dir / f"{safe_tag}.tif"
+
+        # Temporary intermediate rasters (one per shard)
+        shard_tifs = []
+
+        for csv_file in shard_csvs:
+            shard_tif = out_dir / f"{csv_file.stem}.tif"
+
+            subprocess.run([
+                "gdal_rasterize",
+                "-a", "BURN",
+                "-a_srs", "EPSG:4326",
+                "-oo", "GEOM_POSSIBLE_NAMES=WKT",
+                "-ot", "Byte",
+                "-te", *map(str, bounds),
+                "-tr", str(res), str(res),
+                "-a_nodata", "0",
+                "-co", "TILED=YES",
+                "-co", "COMPRESS=NONE",
+                "-co", "BIGTIFF=YES",
+                f"CSV:{csv_file}",
+                str(shard_tif)
+            ], check=True)
+
+            shard_tifs.append(shard_tif)
+
+        # Merge shards for this tag into one final .tif
+        if len(shard_tifs) > 1:
+            args = [
+                "gdal_merge.py", "-o", str(out_tif),
+                "-of", "GTiff",
+                "-co", "TILED=YES",
+                "-co", "BIGTIFF=YES",
+                "-n", "0", "-a_nodata", "0",
+            ] + [str(p) for p in shard_tifs]
+            subprocess.run(args, check=True)
+            for t in shard_tifs:
+                t.unlink(missing_ok=True)
+        else:
+            shutil.move(str(shard_tifs[0]), str(out_tif))
+
+        return out_tif
+
+    except Exception as e:
+        print(f"[RASTERIZE] Failed for {tag}: {e}")
+        return None
+
 
 def rasterize_all_fast(
     csvs: List[Path],
@@ -522,61 +575,14 @@ def rasterize_all_fast(
 
     print(f"[RASTERIZE] {len(tag_groups)} unique tags found.")
 
-    def _rasterize_tag_group(tag: str, shard_csvs: List[Path]) -> Optional[Path]:
-        """Rasterize all CSV shards for a tag into one .tif for the tile."""
-        try:
-            safe_tag = re.sub(r"[=:/@]", "_", tag)
-            out_tif = out_dir / f"{safe_tag}.tif"
-
-            # Temporary intermediate rasters (one per shard)
-            shard_tifs = []
-
-            for csv_file in shard_csvs:
-                shard_tif = out_dir / f"{csv_file.stem}.tif"
-                
-                subprocess.run([
-                    "gdal_rasterize",
-                    "-a", "BURN",
-                    "-a_srs", "EPSG:4326",
-                    "-oo", "GEOM_POSSIBLE_NAMES=WKT",
-                    "-ot", "Byte",
-                    "-te", *map(str, bounds),
-                    "-tr", str(res), str(res),
-                    "-a_nodata", "0",
-                    "-co", "TILED=YES",
-                    "-co", "COMPRESS=NONE",
-                    "-co", "BIGTIFF=YES",
-                    f"CSV:{csv_file}",
-                    str(shard_tif)
-                ], check=True)
-
-                shard_tifs.append(shard_tif)
-
-            # Merge shards for this tag into one final .tif
-            if len(shard_tifs) > 1:
-                args = [
-                    "gdal_merge.py", "-o", str(out_tif),
-                    "-of", "GTiff",
-                    "-co", "TILED=YES",
-                    "-co", "BIGTIFF=YES",
-                    "-n", "0", "-a_nodata", "0",
-                ] + [str(p) for p in shard_tifs]
-                subprocess.run(args, check=True)
-                for t in shard_tifs:
-                    t.unlink(missing_ok=True)
-            else:
-                shutil.move(str(shard_tifs[0]), str(out_tif))
-
-            return out_tif
-
-        except Exception as e:
-            print(f"[RASTERIZE] Failed for {tag}: {e}")
-            return None
-
     # Run in parallel per tag group
     out_tifs = []
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        futures = {exe.submit(_rasterize_tag_group, tag, group): tag for tag, group in tag_groups.items()}
+        futures = {
+            exe.submit(_rasterize_tag_group, tag, group, out_dir, bounds, res): tag
+            for tag, group in tag_groups.items()
+        }
+
         for i, f in enumerate(as_completed(futures), 1):
             tag = futures[f]
             result = f.result()
