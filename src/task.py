@@ -440,7 +440,7 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
                 if (tag_val not in tag_files) or (tag_row_counts[tag_val] >= max_rows):
                     if tag_val in tag_fhandles:
                         tag_fhandles[tag_val].close()
-                    safe = tag_val.replace(":", "_").replace("/", "_")
+                    safe = re.sub(r"[=:/@]", "_", tag_val)
                     shard_idx = tag_shard_counts[tag_val] + 1
                     out_path = csv_dir / f"{safe}_{shard_idx:03d}.csv"
                     fh = open(out_path, "w", newline="", encoding="utf-8")
@@ -557,7 +557,9 @@ def rasterize_all_fast(
     # Group CSV shards by tag base name
     tag_groups = defaultdict(list)
     for csv_path in csvs:
+        # Remove trailing _001 etc., and normalize weird chars
         tag_base = re.sub(r"(_[0-9]{3})+$", "", csv_path.stem)
+        tag_base = re.sub(r"[=:/@]", "_", tag_base)
         tag_groups[tag_base].append(csv_path)
 
     print(f"[RASTERIZE] {len(tag_groups)} unique tags found. Using {num_cpus} workers.")
