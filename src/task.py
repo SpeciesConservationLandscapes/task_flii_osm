@@ -605,18 +605,24 @@ def merge_tag_shards_fast(raster_dir: Path) -> List[Path]:
         # 1. Build virtual stack
         subprocess.run(["gdalbuildvrt", "-separate", str(tmp_vrt)] + [str(p) for p in group], check=True)
         # 2. Sum all bands directly
-        expr = " + ".join([chr(65 + i) for i in range(len(group))])
-        args = [
-            "gdal_calc.py", "--quiet", "--overwrite",
-            f"--outfile={str(out_path)}",
-            "--calc", expr,
-            "--type=Byte",
-            "--co=COMPRESS=NONE",
-            "--co=BIGTIFF=YES",
-        ]
-        for i, p in enumerate(group):
-            args.extend([f"-{chr(65+i)}", str(p)])
-        subprocess.run(args, check=True)
+        # If group is large, handle safely in chunks
+        if len(group) > 26:
+            print(f"[MERGE] {base} has {len(group)} shards — using safe chunked merge.")
+            _calc_sum_safe(group, out_path, chunk_size=20)
+        else:
+            expr = " + ".join([chr(65 + i) for i in range(len(group))])
+            args = [
+                "gdal_calc.py", "--quiet", "--overwrite",
+                f"--outfile={str(out_path)}",
+                "--calc", expr,
+                "--type=Byte",
+                "--co=COMPRESS=NONE",
+                "--co=BIGTIFF=YES",
+            ]
+            for i, p in enumerate(group):
+                args.extend([f"-{chr(65+i)}", str(p)])
+            subprocess.run(args, check=True)
+
         tmp_vrt.unlink(missing_ok=True)
         merged_paths.append(out_path)
 
