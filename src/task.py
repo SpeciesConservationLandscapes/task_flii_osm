@@ -497,7 +497,7 @@ def _rasterize_tag_group(
     """
     Rasterize all CSV shards for a tag into one .tif for the given tile.
 
-    Each CSV contains 'WKT' and 'BURN' fields. The BURN value is rasterized as pixel intensity.
+    Each CSV contains 'WKT' and 'BURN' fields. The BURN value is rasterized as pixel value.
     This function merges multiple CSV shards for the same tag into one raster per tile.
     """
     try:
@@ -698,6 +698,68 @@ def sum_all_rasters(inputs: List[Path], out_path: Path):
         return
     print(f"[MERGE] Summing {len(inputs)} rasters into {out_path.name} (multi-threaded) ...")
     _calc_sum_safe(inputs, out_path)
+
+def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir):
+    """Merge all tile rasters for a tag into a global GeoTIFF using VRT + gdal_translate."""
+    input_tifs = sorted(Path(tiles_dir).rglob(f"*/{tag}.tif"))
+    if not input_tifs:
+        print(f"[SKIP] No rasters found for tag {tag}")
+        return tag, None
+
+    vrt_path = Path(output_dir) / f"{tag}.vrt"
+    out_tif = Path(output_dir) / f"{tag}_global.tif"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Skip if already created (resume-safe)
+    if out_tif.exists():
+        print(f"[SKIP] Already merged {tag}")
+        return tag, out_tif
+
+    buildvrt_cmd = ["gdalbuildvrt", str(vrt_path)] + [str(f) for f in input_tifs]
+    translate_cmd = [
+        "gdal_translate", str(vrt_path), str(out_tif),
+        "-co", "COMPRESS=LZW",
+        "-co", "BIGTIFF=YES",
+        "-co", "TILED=YES",
+        "-a_nodata", "0"
+    ]
+
+    try:
+        subprocess.run(buildvrt_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(translate_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[MERGE OK] {tag} → {out_tif}")
+        return tag, out_tif
+    except subprocess.CalledProcessError:
+        print(f"[MERGE FAIL] {tag}")
+        return tag, None
+
+
+def merge_all_tags_parallel(tags, tiles_dir, output_dir, max_workers=None):
+    """Run VRT-based merges for all tags in parallel."""
+    if max_workers is None:
+        max_workers = min(12, multiprocessing.cpu_count())
+
+    tiles_dir = Path(tiles_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[MERGE] Starting parallel global merges for {len(tags)} tags using {max_workers} workers...")
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(merge_tag_across_tiles_vrt, tag, tiles_dir, output_dir): tag for tag in tags}
+
+        for i, f in enumerate(as_completed(futures), 1):
+            tag = futures[f]
+            try:
+                _, result = f.result()
+                if result:
+                    print(f"[{i}/{len(tags)}] Done: {tag}")
+            except Exception as e:
+                print(f"[ERROR] {tag}: {e}")
+
+    print(f"[MERGE] All tag merges complete. Outputs in {output_dir}")
+
 
 def upload_to_gcs(local_path: Path, gcs_uri: str):
     """
@@ -1024,7 +1086,7 @@ def main():
                 except Exception as e:
                     print(f"[TILE {i}] Failed: {e}")
 
-    with log_time("[5] Merge all tile rasters into global layer"):
+    with log_time("[5a] Merge all tile rasters into global layer"):
         tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
         if not tile_outputs:
             print("[WARN] No tile rasters found for merging.")
@@ -1041,9 +1103,30 @@ def main():
             ] + [str(t) for t in tile_outputs], check=True)
             print(f"[MERGE] Global raster created: {merged_path}")
 
+    with log_time("[5b] Merge per-tag rasters across tiles into global tag layers"):
+        globals_dir = year_dir / "globals"
+        tiles_dir = raster_dir
+
+        # Collect unique tags from all tile rasters (skip infra tiles)
+        unique_tags = sorted({
+            p.stem for p in Path(tiles_dir).rglob("*.tif")
+            if not p.name.startswith("infra_tile")
+        })
+
+        if not unique_tags:
+            print("[MERGE] No per-tag rasters found to merge.")
+        else:
+            # Optional: skip if globals already exist (resume-safe)
+            existing_globals = list(globals_dir.glob("*_global.tif"))
+            if existing_globals:
+                print(f"[SKIP] Found {len(existing_globals)} global tag rasters — skipping merge.")
+            else:
+                merge_all_tags_parallel(unique_tags, tiles_dir, globals_dir, max_workers=8)
+
+
     with log_time("[6] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
-        export_rasters_to_gee(raster_dir, year, res, upload_merged_only)
+        export_rasters_to_gee(year_dir / "globals", year, res, upload_merged_only)
 
     # Optionally clean up intermediates.
     if do_cleanup:
