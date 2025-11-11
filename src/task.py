@@ -1104,8 +1104,8 @@ def main():
             print(f"[MERGE] Global raster created: {merged_path}")
 
     with log_time("[5b] Merge per-tag rasters across tiles into global tag layers"):
-        globals_dir = year_dir / "globals"
         tiles_dir = raster_dir
+        output_dir = raster_dir  # keep globals here
 
         # Collect unique tags from all tile rasters (skip infra tiles)
         unique_tags = sorted({
@@ -1116,17 +1116,15 @@ def main():
         if not unique_tags:
             print("[MERGE] No per-tag rasters found to merge.")
         else:
-            # Optional: skip if globals already exist (resume-safe)
-            existing_globals = list(globals_dir.glob("*_global.tif"))
+            existing_globals = list(output_dir.glob("*_global.tif"))
             if existing_globals:
                 print(f"[SKIP] Found {len(existing_globals)} global tag rasters — skipping merge.")
             else:
-                merge_all_tags_parallel(unique_tags, tiles_dir, globals_dir, max_workers=8)
-
+                merge_all_tags_parallel(unique_tags, tiles_dir, output_dir, max_workers=8)
 
     with log_time("[6] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
-        export_rasters_to_gee(year_dir / "globals", year, res, upload_merged_only)
+        export_rasters_to_gee(raster_dir, year, res, upload_merged_only)
 
     # Optionally clean up intermediates.
     if do_cleanup:
