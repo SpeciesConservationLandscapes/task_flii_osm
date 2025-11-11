@@ -587,8 +587,9 @@ def merge_tag_shards_fast(raster_dir: Path) -> List[Path]:
 
     tag_groups = defaultdict(list)
     for r in rasters:
-        base = re.sub(r"_[0-9]{3}$", "", r.stem)
+        base = re.sub(r"(_[0-9]{3})+$", "", r.stem)
         tag_groups[base].append(r)
+
 
     merged_paths = []
     for base, group in tag_groups.items():
@@ -827,24 +828,63 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
 
     res_m = degrees_to_meters(res)
 
+    # Paths
+    merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
+    if not merged_candidate.exists():
+        print("[EXPORT WARN] Global merged raster not found yet.")
+    else:
+        print(f"[EXPORT] Found global raster: {merged_candidate.name}")
+
+    # --- Collect tag rasters from all tiles ---
+    tile_tag_rasters = defaultdict(list)
+    for tif in raster_dir.rglob("*.tif"):
+        name = tif.name
+        if name.startswith("infra_tile"):
+            continue  # skip tile-level infra layers
+        if "tmp" in tif.name or tif.name.startswith("sum_"):
+            continue  # skip intermediate sums
+        tag_key = tif.stem
+        tile_tag_rasters[tag_key].append(tif)
+
+    # --- Merge tag rasters across tiles into global tag rasters ---
+    global_tag_rasters = []
+    if not upload_merged_only:
+        print(f"[EXPORT] Merging {len(tile_tag_rasters)} tag rasters across tiles → global layers")
+        for tag, rasters in tile_tag_rasters.items():
+            out_tif = raster_dir / f"{tag}.tif"
+            if len(rasters) == 1:
+                shutil.copy(rasters[0], out_tif)
+            else:
+                args = [
+                    "gdal_merge.py", "-o", str(out_tif),
+                    "-of", "GTiff",
+                    "-co", "TILED=YES",
+                    "-co", "COMPRESS=LZW",
+                    "-co", "BIGTIFF=YES",
+                    "-n", "0", "-a_nodata", "0",
+                ] + [str(p) for p in rasters]
+                subprocess.run(args, check=True)
+            global_tag_rasters.append(out_tif)
+        print(f"[EXPORT] Created {len(global_tag_rasters)} global tag rasters.")
+
+    # --- Assemble upload list ---
     if upload_merged_only:
-        merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
         if not merged_candidate.exists():
-            print("[EXPORT] Merged raster not found — cannot upload merged-only.")
+            print("[EXPORT] No global raster found to upload in merged-only mode.")
             return
         tifs = [merged_candidate]
-        print(f"[EXPORT] Uploading only merged raster: {merged_candidate.name}")
+        print("[EXPORT] Uploading only final infrastructure raster.")
     else:
-        tifs = list(raster_dir.glob("*.tif"))
-        merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
+        tifs = global_tag_rasters
         if merged_candidate.exists():
             tifs.append(merged_candidate)
-            print(f"[EXPORT] Including merged raster: {merged_candidate.name}")
+            print("[EXPORT] Including final infrastructure raster in upload set.")
 
     if not tifs:
         print("[EXPORT] No rasters found to export.")
         return
 
+    # --- Upload to GCS and GEE ---
     exported_assets = []
     for tif in tifs:
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
@@ -869,6 +909,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
                 "status": f"failed - {e}"
             })
 
+    # --- Save export metadata ---
     metadata_path = raster_dir / f"gee_export_metadata_{year}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(exported_assets, f, indent=2)
@@ -880,9 +921,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
     except subprocess.CalledProcessError as e:
         print(f"[WARN] Could not upload metadata to GCS: {e}")
 
-    print(f"Export summary saved: {gcs_metadata_uri}")
-
-    # OSM metadata file.
+    # --- Upload OSM metadata ---
     osm_meta_path = raster_dir.parent / "osm_download_metadata.json"
     if osm_meta_path.exists():
         osm_gcs_uri = f"gs://{GCS_BUCKET}/{year}/osm_download_metadata.json"
@@ -893,6 +932,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
             print(f"[WARN] Could not upload OSM metadata to GCS: {e}")
     else:
         print("[WARN] No OSM metadata file found to upload.")
+
 
 def cleanup_intermediates(year_dir: Path):
     """
