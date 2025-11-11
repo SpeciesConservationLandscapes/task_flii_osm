@@ -7,7 +7,7 @@ RUN apt-get update && \
         osmium-tool \
         python3 python3-pip \
         git \
-        python3-gdal gdal-bin \
+        python3-gdal gdal-bin libgdal-dev \
         curl apt-transport-https ca-certificates gnupg wget coreutils \
         procps psmisc lsof && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
