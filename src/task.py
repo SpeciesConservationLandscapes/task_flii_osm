@@ -497,46 +497,6 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=30):
         x += step
     return tiles
 
-
-def _rasterize_single_fast(
-    in_csv: Union[str, Path],
-    out_tif: Union[str, Path],
-    bounds: Tuple[float, float, float, float],
-    res: float,
-    burn_value: int
-):
-    """
-    Extremely fast rasterization of 2-column CSV (WKT,BURN).
-    Uses constant burn values (already known per CSV/tag),
-    writes uncompressed tiled GeoTIFF for maximum throughput.
-    """
-    out_tif = Path(out_tif)
-    out_tif.parent.mkdir(parents=True, exist_ok=True)
-
-    opts = gdal.RasterizeOptions(
-        format="GTiff",
-        outputType=gdalconst.GDT_Byte,
-        noData=0,
-        initValues=0,
-        burnValues=[burn_value],  
-        attribute=None,
-        xRes=res,
-        yRes=res,
-        targetAlignedPixels=True,
-        outputSRS="EPSG:4326",
-        outputBounds=bounds,
-        creationOptions=[
-            "TILED=YES",
-            "BLOCKXSIZE=1024",
-            "BLOCKYSIZE=1024",
-            "COMPRESS=NONE", 
-            "BIGTIFF=YES",
-        ],
-    )
-    gdal.Rasterize(str(out_tif), str(in_csv), options=opts)
-    return out_tif
-
-
 def rasterize_all_fast(
     csvs: List[Path],
     out_dir: Path,
@@ -545,91 +505,77 @@ def rasterize_all_fast(
     config: dict
 ) -> List[Path]:
     """
-    Rasterize all tag CSVs in parallel using constant burn values.
-    Infers burn value from config dict (tag=value).
+    Rasterize all tag CSVs in parallel using constant burn values,
+    grouping all shard CSVs (e.g., highway_residential_001.csv, _002.csv)
+    into a single rasterization per tag per tile.
+    Much faster and I/O-efficient than per-shard rasterization.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     num_cpus = max(1, multiprocessing.cpu_count() - 1)
-    print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers (uncompressed, constant burn)...")
+    print(f"[RASTERIZE] {len(csvs)} CSV shards detected — grouping by tag for 1-step rasterization.")
 
+    # Group CSV shards by tag base name
+    tag_groups = defaultdict(list)
+    for csv_path in csvs:
+        tag_base = re.sub(r"(_[0-9]{3})+$", "", csv_path.stem)
+        tag_groups[tag_base].append(csv_path)
+
+    print(f"[RASTERIZE] {len(tag_groups)} unique tags found. Using {num_cpus} workers.")
+
+    def _rasterize_tag_group(tag: str, shard_csvs: List[Path]):
+        """Rasterize all shards for a tag into one .tif using a temporary VRT."""
+        try:
+            burn_value = _infer_burn_from_csv(shard_csvs[0], default=1)
+            safe_tag = re.sub(r"[=:/@]", "_", tag)
+            vrt_path = out_dir / f"{safe_tag}_tmp.vrt"
+            out_tif = out_dir / f"{safe_tag}.tif"
+
+            # Build a lightweight VRT mosaic of all shards
+            subprocess.run(["gdalbuildvrt", str(vrt_path)] + [str(c) for c in shard_csvs], check=True)
+
+            opts = gdal.RasterizeOptions(
+                format="GTiff",
+                outputType=gdalconst.GDT_Byte,
+                noData=0,
+                initValues=0,
+                burnValues=[burn_value],
+                xRes=res,
+                yRes=res,
+                targetAlignedPixels=True,
+                outputSRS="EPSG:4326",
+                outputBounds=bounds,
+                creationOptions=[
+                    "TILED=YES",
+                    "BLOCKXSIZE=1024",
+                    "BLOCKYSIZE=1024",
+                    "COMPRESS=NONE",
+                    "BIGTIFF=YES",
+                ],
+            )
+
+            # Rasterize from VRT directly
+            gdal.Rasterize(str(out_tif), str(vrt_path), options=opts)
+
+            vrt_path.unlink(missing_ok=True)
+            return out_tif
+        except Exception as e:
+            print(f"[RASTERIZE] Failed for {tag}: {e}")
+            return None
+
+    # Parallel execution
     out_tifs = []
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        futures = {}
-        for csv_path in csvs:
-            burn_value = _infer_burn_from_csv(csv_path, default=1)
-            safe_stem = re.sub(r"[=:/@]", "_", csv_path.stem)
-            out_tif = out_dir / f"{safe_stem}.tif"
-            fut = exe.submit(_rasterize_single_fast, csv_path, out_tif, bounds, res, burn_value)
-            futures[fut] = out_tif
-
+        futures = {exe.submit(_rasterize_tag_group, tag, group): tag for tag, group in tag_groups.items()}
         for i, f in enumerate(as_completed(futures), 1):
-            out_path = futures[f]
-            try:
-                f.result()
-                out_tifs.append(out_path)
-                if i % 10 == 0 or i == len(futures):
-                    print(f"[RASTERIZE] Completed {i}/{len(futures)}")
-            except Exception as e:
-                print(f"[RASTERIZE] Failed on {out_path.name}: {e}")
+            tag = futures[f]
+            result = f.result()
+            if result is not None:
+                out_tifs.append(result)
+            if i % 10 == 0 or i == len(futures):
+                print(f"[RASTERIZE] Completed {i}/{len(futures)} tags")
 
+    print(f"[RASTERIZE] Finished rasterizing {len(out_tifs)} tags for this tile.")
     return out_tifs
-
-def merge_tag_shards_fast(raster_dir: Path) -> List[Path]:
-    """
-    Merge tag-level shards (e.g., highway_residential_001, _002)
-    into a single raster per tag.  Uses gdalbuildvrt + gdal_calc
-    but with fewer I/O passes.
-    """
-    rasters = sorted(raster_dir.glob("*.tif"))
-    if not rasters:
-        print("[MERGE] No rasters found.")
-        return []
-
-    tag_groups = defaultdict(list)
-    for r in rasters:
-        base = re.sub(r"(_[0-9]{3})+$", "", r.stem)
-        tag_groups[base].append(r)
-
-
-    merged_paths = []
-    for base, group in tag_groups.items():
-        if len(group) == 1:
-            merged_paths.append(group[0])
-            continue
-
-        safe_base = re.sub(r"[=:/@]", "_", base)
-        out_path = raster_dir / f"{safe_base}.tif"
-        tmp_vrt = raster_dir / f"{safe_base}_tmp.vrt"
-
-        print(f"[MERGE] Merging {len(group)} shards → {out_path.name}")
-
-        # 1. Build virtual stack
-        subprocess.run(["gdalbuildvrt", "-separate", str(tmp_vrt)] + [str(p) for p in group], check=True)
-        # 2. Sum all bands directly
-        # If group is large, handle safely in chunks
-        if len(group) > 26:
-            print(f"[MERGE] {base} has {len(group)} shards — using safe chunked merge.")
-            _calc_sum_safe(group, out_path, chunk_size=20)
-        else:
-            expr = " + ".join([chr(65 + i) for i in range(len(group))])
-            args = [
-                "gdal_calc.py", "--quiet", "--overwrite",
-                f"--outfile={str(out_path)}",
-                "--calc", expr,
-                "--type=Byte",
-                "--co=COMPRESS=NONE",
-                "--co=BIGTIFF=YES",
-            ]
-            for i, p in enumerate(group):
-                args.extend([f"-{chr(65+i)}", str(p)])
-            subprocess.run(args, check=True)
-
-        tmp_vrt.unlink(missing_ok=True)
-        merged_paths.append(out_path)
-
-    print(f"[MERGE] Produced {len(merged_paths)} merged rasters.")
-    return merged_paths
-
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
@@ -1037,8 +983,7 @@ def main():
         if not csv_files:
             print("[WARN] No CSV files to rasterize.")
         else:
-            # Generate spatial tiles
-            tile_size = 30  # degrees (change to 10 or 20 for finer tiling)
+            tile_size = 30
             tiles = generate_global_tiles(bounds, step=tile_size)
             print(f"[RASTERIZE] Splitting world into {len(tiles)} tiles of {tile_size}°×{tile_size}°")
 
@@ -1049,12 +994,11 @@ def main():
                 tile_dir.mkdir(parents=True, exist_ok=True)
 
                 try:
-                    rasters = rasterize_all_fast(csv_files, tile_dir, tile_bounds, res, categories)
-                    tag_rasters = merge_tag_shards_fast(tile_dir)
+                    tag_rasters = rasterize_all_fast(csv_files, tile_dir, tile_bounds, res, categories)
                     tile_out = tile_dir / f"infra_tile_{i:03d}.tif"
                     sum_all_rasters(tag_rasters, tile_out)
                     tile_outputs.append(tile_out)
-                    print(f"[TILE {i}] Completed and saved to {tile_out.name}")
+                    print(f"[TILE {i}] Completed and saved {tile_out.name}")
                 except Exception as e:
                     print(f"[TILE {i}] Failed: {e}")
 
