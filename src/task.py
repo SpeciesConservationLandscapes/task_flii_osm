@@ -497,6 +497,47 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=30):
         x += step
     return tiles
 
+def _rasterize_tag_group(args):
+    """Top-level helper (picklable) for rasterizing all shards of a tag."""
+    tag, shard_csvs, out_dir, bounds, res = args
+    try:
+        burn_value = _infer_burn_from_csv(shard_csvs[0], default=1)
+        safe_tag = re.sub(r"[=:/@]", "_", tag)
+        vrt_path = out_dir / f"{safe_tag}_tmp.vrt"
+        out_tif = out_dir / f"{safe_tag}.tif"
+
+        # Build a lightweight VRT mosaic of all shards
+        subprocess.run(["gdalbuildvrt", str(vrt_path)] + [str(c) for c in shard_csvs], check=True)
+
+        opts = gdal.RasterizeOptions(
+            format="GTiff",
+            outputType=gdalconst.GDT_Byte,
+            noData=0,
+            initValues=0,
+            burnValues=[burn_value],
+            xRes=res,
+            yRes=res,
+            targetAlignedPixels=True,
+            outputSRS="EPSG:4326",
+            outputBounds=bounds,
+            creationOptions=[
+                "TILED=YES",
+                "BLOCKXSIZE=1024",
+                "BLOCKYSIZE=1024",
+                "COMPRESS=NONE",
+                "BIGTIFF=YES",
+            ],
+        )
+
+        # Rasterize from VRT directly
+        gdal.Rasterize(str(out_tif), str(vrt_path), options=opts)
+        vrt_path.unlink(missing_ok=True)
+        return out_tif
+    except Exception as e:
+        print(f"[RASTERIZE] Failed for {tag}: {e}")
+        return None
+
+
 def rasterize_all_fast(
     csvs: List[Path],
     out_dir: Path,
@@ -508,7 +549,6 @@ def rasterize_all_fast(
     Rasterize all tag CSVs in parallel using constant burn values,
     grouping all shard CSVs (e.g., highway_residential_001.csv, _002.csv)
     into a single rasterization per tag per tile.
-    Much faster and I/O-efficient than per-shard rasterization.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     num_cpus = max(1, multiprocessing.cpu_count() - 1)
@@ -522,60 +562,22 @@ def rasterize_all_fast(
 
     print(f"[RASTERIZE] {len(tag_groups)} unique tags found. Using {num_cpus} workers.")
 
-    def _rasterize_tag_group(tag: str, shard_csvs: List[Path]):
-        """Rasterize all shards for a tag into one .tif using a temporary VRT."""
-        try:
-            burn_value = _infer_burn_from_csv(shard_csvs[0], default=1)
-            safe_tag = re.sub(r"[=:/@]", "_", tag)
-            vrt_path = out_dir / f"{safe_tag}_tmp.vrt"
-            out_tif = out_dir / f"{safe_tag}.tif"
+    tasks = [(tag, group, out_dir, bounds, res) for tag, group in tag_groups.items()]
 
-            # Build a lightweight VRT mosaic of all shards
-            subprocess.run(["gdalbuildvrt", str(vrt_path)] + [str(c) for c in shard_csvs], check=True)
-
-            opts = gdal.RasterizeOptions(
-                format="GTiff",
-                outputType=gdalconst.GDT_Byte,
-                noData=0,
-                initValues=0,
-                burnValues=[burn_value],
-                xRes=res,
-                yRes=res,
-                targetAlignedPixels=True,
-                outputSRS="EPSG:4326",
-                outputBounds=bounds,
-                creationOptions=[
-                    "TILED=YES",
-                    "BLOCKXSIZE=1024",
-                    "BLOCKYSIZE=1024",
-                    "COMPRESS=NONE",
-                    "BIGTIFF=YES",
-                ],
-            )
-
-            # Rasterize from VRT directly
-            gdal.Rasterize(str(out_tif), str(vrt_path), options=opts)
-
-            vrt_path.unlink(missing_ok=True)
-            return out_tif
-        except Exception as e:
-            print(f"[RASTERIZE] Failed for {tag}: {e}")
-            return None
-
-    # Parallel execution
     out_tifs = []
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        futures = {exe.submit(_rasterize_tag_group, tag, group): tag for tag, group in tag_groups.items()}
+        futures = {exe.submit(_rasterize_tag_group, t): t[0] for t in tasks}
         for i, f in enumerate(as_completed(futures), 1):
             tag = futures[f]
             result = f.result()
-            if result is not None:
+            if result:
                 out_tifs.append(result)
             if i % 10 == 0 or i == len(futures):
                 print(f"[RASTERIZE] Completed {i}/{len(futures)} tags")
 
     print(f"[RASTERIZE] Finished rasterizing {len(out_tifs)} tags for this tile.")
     return out_tifs
+
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
