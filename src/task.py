@@ -978,7 +978,12 @@ def main():
         if not txt_files:
             print("[WARN] No OSM text file found.")
         else:
-            split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
+            existing_csvs = list(csv_dir.glob("*.csv"))
+            if existing_csvs:
+                print(f"[SKIP] Found {len(existing_csvs)} CSV files — skipping text-to-CSV conversion.")
+            else:
+                print("[SPLIT] No CSVs found — generating from text...")
+                split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
 
     with log_time("[4] Rasterize CSVs by tile (parallel within tiles)"):
         csv_files = list(csv_dir.glob("*.csv"))
