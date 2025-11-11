@@ -497,47 +497,6 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=30):
         x += step
     return tiles
 
-def _rasterize_tag_group(args):
-    """Top-level helper (picklable) for rasterizing all shards of a tag."""
-    tag, shard_csvs, out_dir, bounds, res = args
-    try:
-        burn_value = _infer_burn_from_csv(shard_csvs[0], default=1)
-        safe_tag = re.sub(r"[=:/@]", "_", tag)
-        vrt_path = out_dir / f"{safe_tag}_tmp.vrt"
-        out_tif = out_dir / f"{safe_tag}.tif"
-
-        # Build a lightweight VRT mosaic of all shards
-        subprocess.run(["gdalbuildvrt", str(vrt_path)] + [str(c) for c in shard_csvs], check=True)
-
-        opts = gdal.RasterizeOptions(
-            format="GTiff",
-            outputType=gdalconst.GDT_Byte,
-            noData=0,
-            initValues=0,
-            burnValues=[burn_value],
-            xRes=res,
-            yRes=res,
-            targetAlignedPixels=True,
-            outputSRS="EPSG:4326",
-            outputBounds=bounds,
-            creationOptions=[
-                "TILED=YES",
-                "BLOCKXSIZE=1024",
-                "BLOCKYSIZE=1024",
-                "COMPRESS=NONE",
-                "BIGTIFF=YES",
-            ],
-        )
-
-        # Rasterize from VRT directly
-        gdal.Rasterize(str(out_tif), str(vrt_path), options=opts)
-        vrt_path.unlink(missing_ok=True)
-        return out_tif
-    except Exception as e:
-        print(f"[RASTERIZE] Failed for {tag}: {e}")
-        return None
-
-
 def rasterize_all_fast(
     csvs: List[Path],
     out_dir: Path,
@@ -546,29 +505,78 @@ def rasterize_all_fast(
     config: dict
 ) -> List[Path]:
     """
-    Rasterize all tag CSVs in parallel using constant burn values,
-    grouping all shard CSVs (e.g., highway_residential_001.csv, _002.csv)
-    into a single rasterization per tag per tile.
+    Rasterize all tag CSVs into per-tag .tif files within the tile extent.
+    Each tag will produce one raster per tile, with pixel values derived from the CSV's BURN field.
+    This mirrors HII's method but supports multiprocessing and tiling.
     """
+
     out_dir.mkdir(parents=True, exist_ok=True)
     num_cpus = max(1, multiprocessing.cpu_count() - 1)
-    print(f"[RASTERIZE] {len(csvs)} CSV shards detected — grouping by tag for 1-step rasterization.")
+    print(f"[RASTERIZE] {len(csvs)} CSV shards detected — using {num_cpus} workers.")
 
-    # Group CSV shards by tag base name
+    # Group all CSV shards by tag name (strip shard suffix)
     tag_groups = defaultdict(list)
     for csv_path in csvs:
-        # Remove trailing _001 etc., and normalize weird chars
         tag_base = re.sub(r"(_[0-9]{3})+$", "", csv_path.stem)
-        tag_base = re.sub(r"[=:/@]", "_", tag_base)
         tag_groups[tag_base].append(csv_path)
 
-    print(f"[RASTERIZE] {len(tag_groups)} unique tags found. Using {num_cpus} workers.")
+    print(f"[RASTERIZE] {len(tag_groups)} unique tags found.")
 
-    tasks = [(tag, group, out_dir, bounds, res) for tag, group in tag_groups.items()]
+    def _rasterize_tag_group(tag: str, shard_csvs: List[Path]) -> Optional[Path]:
+        """Rasterize all CSV shards for a tag into one .tif for the tile."""
+        try:
+            safe_tag = re.sub(r"[=:/@]", "_", tag)
+            out_tif = out_dir / f"{safe_tag}.tif"
 
+            # Temporary intermediate rasters (one per shard)
+            shard_tifs = []
+
+            for csv_file in shard_csvs:
+                shard_tif = out_dir / f"{csv_file.stem}.tif"
+                
+                subprocess.run([
+                    "gdal_rasterize",
+                    "-a", "BURN",
+                    "-a_srs", "EPSG:4326",
+                    "-oo", "GEOM_POSSIBLE_NAMES=WKT",
+                    "-ot", "Byte",
+                    "-te", *map(str, bounds),
+                    "-tr", str(res), str(res),
+                    "-a_nodata", "0",
+                    "-co", "TILED=YES",
+                    "-co", "COMPRESS=NONE",
+                    "-co", "BIGTIFF=YES",
+                    f"CSV:{csv_file}",
+                    str(shard_tif)
+                ], check=True)
+
+                shard_tifs.append(shard_tif)
+
+            # Merge shards for this tag into one final .tif
+            if len(shard_tifs) > 1:
+                args = [
+                    "gdal_merge.py", "-o", str(out_tif),
+                    "-of", "GTiff",
+                    "-co", "TILED=YES",
+                    "-co", "BIGTIFF=YES",
+                    "-n", "0", "-a_nodata", "0",
+                ] + [str(p) for p in shard_tifs]
+                subprocess.run(args, check=True)
+                for t in shard_tifs:
+                    t.unlink(missing_ok=True)
+            else:
+                shutil.move(str(shard_tifs[0]), str(out_tif))
+
+            return out_tif
+
+        except Exception as e:
+            print(f"[RASTERIZE] Failed for {tag}: {e}")
+            return None
+
+    # Run in parallel per tag group
     out_tifs = []
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        futures = {exe.submit(_rasterize_tag_group, t): t[0] for t in tasks}
+        futures = {exe.submit(_rasterize_tag_group, tag, group): tag for tag, group in tag_groups.items()}
         for i, f in enumerate(as_completed(futures), 1):
             tag = futures[f]
             result = f.result()
