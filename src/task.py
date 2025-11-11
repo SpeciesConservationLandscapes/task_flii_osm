@@ -514,7 +514,6 @@ def _rasterize_tag_group(
                 "gdal_rasterize",
                 "-a", "BURN",
                 "-a_srs", "EPSG:4326",
-                "-oo", "GEOM_POSSIBLE_NAMES=WKT",
                 "-ot", "Byte",
                 "-te", *map(str, bounds),
                 "-tr", str(res), str(res),
