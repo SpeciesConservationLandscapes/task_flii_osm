@@ -913,21 +913,21 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
         print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
         raise
 
-def export_rasters_to_gee(raster_dir: Path, year: int, res: float):
+def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
-    Uploads per-tag global rasters (*_global.tif) and the merged infrastructure layer
-    to Google Cloud Storage and imports them as Earth Engine assets.
-    The OSM download metadata file is also uploaded to GCS.
+    Uploads rasters to GCS and imports them as Earth Engine assets.
+    - If upload_merged_only=True: uploads only the final infrastructure raster.
+    - Otherwise: uploads all per-tag global rasters plus the infrastructure raster.
     """
 
-    print(f"[EXPORT] Uploading per-tag and infrastructure rasters for {year}...")
+    print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
 
     res_m = degrees_to_meters(res)
     merged_infra = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
 
     # --- Collect rasters to upload ---
     tag_rasters = sorted(raster_dir.glob("*_global.tif"))
-    if not tag_rasters:
+    if not tag_rasters and not upload_merged_only:
         print("[WARN] No global tag rasters found — skipping tag uploads.")
 
     to_upload = []
@@ -937,14 +937,16 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float):
     else:
         print("[WARN] Infrastructure raster not found — skipping.")
 
-    to_upload.extend(tag_rasters)
+    if not upload_merged_only:
+        to_upload.extend(tag_rasters)
+
     if not to_upload:
         print("[EXPORT] No rasters found to export.")
         return
 
     print(f"[EXPORT] Total rasters to upload: {len(to_upload)}")
 
-    # --- Upload each raster and import to EE ---
+    # --- Upload & import each raster ---
     exported_assets = []
     for tif in to_upload:
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
@@ -955,7 +957,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float):
             print(f"[UPLOAD] Uploading {tif.name} to {gcs_uri}")
             upload_to_gcs(tif, gcs_uri)
 
-            # Detect number of bands (should be 1 for these)
+            # Determine number of bands (1 for per-tag and infra)
             try:
                 ds = gdal.Open(str(tif))
                 band_count = ds.RasterCount if ds else 1
@@ -968,6 +970,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float):
 
             ensure_ee_folder_exists("/".join(asset_id.split("/")[:-1]))
 
+            # Skip existing asset
             try:
                 ee.data.getAsset(asset_id)
                 print(f"[EE IMPORT] Asset already exists: {asset_id} — skipping.")
