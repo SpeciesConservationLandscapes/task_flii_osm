@@ -495,7 +495,7 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
         "gdal_rasterize",
         "-a", "BURN",
         "-a_srs", "EPSG:4326",
-        "-ot", "UInt16",
+        "-ot", "Byte",
         "-at",
         "-te", *map(str, tile_bounds),
         "-tr", str(res), str(res),
@@ -533,7 +533,7 @@ def _calc_sum(inputs: List[Path], out_path: Path):
     args = [
         "gdal_calc.py", "--quiet", "--overwrite",
         f"--outfile={str(out_path)}",
-        "--type=UInt16",
+        "--type=Byte",
         "--calc", calc_expr,
         "--co=COMPRESS=NONE",
         "--co=BIGTIFF=YES",
