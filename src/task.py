@@ -913,57 +913,40 @@ def import_to_earth_engine(asset_id: str, gcs_uri: str):
         print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
         raise
 
-
-def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
+def export_rasters_to_gee(raster_dir: Path, year: int, res: float):
     """
-    Upload rasters to GCS and GEE.
-    If upload_merged_only=True, uploads only the merged final raster (infrastructure layer).
-    Otherwise, uploads all per-tag rasters plus the merged one.
-    Each uploaded raster is registered as a new GEE asset.
+    Uploads per-tag global rasters (*_global.tif) and the merged infrastructure layer
+    to Google Cloud Storage and imports them as Earth Engine assets.
     The OSM download metadata file is also uploaded to GCS.
     """
 
-    print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
+    print(f"[EXPORT] Uploading per-tag and infrastructure rasters for {year}...")
 
     res_m = degrees_to_meters(res)
-
-    # --- Key expected rasters ---
     merged_infra = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
-    multi_band = raster_dir / f"flii_tags_global_{year}_{res_m}m.tif"
 
-    if not merged_infra.exists():
-        print("[WARN] Global infrastructure raster not found.")
-    else:
-        print(f"[EXPORT] Found global infra raster: {merged_infra.name}")
+    # --- Collect rasters to upload ---
+    tag_rasters = sorted(raster_dir.glob("*_global.tif"))
+    if not tag_rasters:
+        print("[WARN] No global tag rasters found — skipping tag uploads.")
 
-    if multi_band.exists():
-        print(f"[EXPORT] Found global multi-band tag raster: {multi_band.name}")
-
-    # --- Gather per-tag rasters (only used if not upload_merged_only) ---
-    tag_rasters = []
-    if not upload_merged_only:
-        for tif in raster_dir.glob("*_global.tif"):
-            tag_rasters.append(tif)
-
-    # --- Build list of rasters to upload ---
     to_upload = []
-
-    if multi_band.exists():
-        to_upload.append(multi_band)
     if merged_infra.exists():
+        print(f"[EXPORT] Found infrastructure raster: {merged_infra.name}")
         to_upload.append(merged_infra)
+    else:
+        print("[WARN] Infrastructure raster not found — skipping.")
 
-    if not upload_merged_only and tag_rasters:
-        to_upload.extend(tag_rasters)
-
+    to_upload.extend(tag_rasters)
     if not to_upload:
         print("[EXPORT] No rasters found to export.")
         return
 
-    # --- Upload & register each raster ---
+    print(f"[EXPORT] Total rasters to upload: {len(to_upload)}")
+
+    # --- Upload each raster and import to EE ---
     exported_assets = []
     for tif in to_upload:
-        # Destination paths
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
         safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
         asset_id = f"{EE_ASSET_ROOT}/{year}/{safe_stem}"
@@ -972,8 +955,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
             print(f"[UPLOAD] Uploading {tif.name} to {gcs_uri}")
             upload_to_gcs(tif, gcs_uri)
 
-            # --- Handle multi-band specially (set band count) ---
-            bands = []
+            # Detect number of bands (should be 1 for these)
             try:
                 ds = gdal.Open(str(tif))
                 band_count = ds.RasterCount if ds else 1
@@ -1214,21 +1196,24 @@ def main():
 
     # Merge per-tile infrastructure rasters into global infra layer
     with log_time("[5a] Merge tile infrastructure rasters into global layer"):
-        tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
-        if not tile_outputs:
-            print("[WARN] No tile rasters found for merging.")
+        if merged_path.exists():
+            print(f"[SKIP] Global infrastructure raster already exists: {merged_path.name}")
         else:
-            print(f"[MERGE] Combining {len(tile_outputs)} tile rasters → {merged_path.name}")
-            subprocess.run([
-                "gdal_merge.py", "-o", str(merged_path),
-                "-of", "GTiff",
-                "-co", "TILED=YES",
-                "-co", "BLOCKXSIZE=1024",
-                "-co", "BLOCKYSIZE=1024",
-                "-co", "COMPRESS=LZW",
-                "-co", "BIGTIFF=YES"
-            ] + [str(t) for t in tile_outputs], check=True)
-            print(f"[MERGE] Global raster created: {merged_path}")
+            tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
+            if not tile_outputs:
+                print("[WARN] No tile rasters found for merging.")
+            else:
+                print(f"[MERGE] Combining {len(tile_outputs)} tile rasters → {merged_path.name}")
+                subprocess.run([
+                    "gdal_merge.py", "-o", str(merged_path),
+                    "-of", "GTiff",
+                    "-co", "TILED=YES",
+                    "-co", "BLOCKXSIZE=1024",
+                    "-co", "BLOCKYSIZE=1024",
+                    "-co", "COMPRESS=LZW",
+                    "-co", "BIGTIFF=YES"
+                ] + [str(t) for t in tile_outputs], check=True)
+                print(f"[MERGE] Global raster created: {merged_path}")
 
     # Merge per-tag rasters across tiles into global rasters
     with log_time("[5b] Merge per-tag rasters across tiles"):
