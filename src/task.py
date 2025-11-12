@@ -555,27 +555,27 @@ def rasterize_all_fast(
     bounds: Tuple[float, float, float, float],
     res: float,
     config: dict
-) -> List[Path]:
+) -> Optional[Path]:
     """
-    Rasterize all tag CSVs into per-tag .tif files within the tile extent.
-    Each tag will produce one raster per tile, with pixel values derived from the CSV's BURN field.
-    This mirrors HII's method but supports multiprocessing and tiling.
+    Rasterize all tag CSVs into a single multi-band GeoTIFF for this tile.
+    Each tag becomes one band. Also returns the list of tag names for reference.
     """
 
     out_dir.mkdir(parents=True, exist_ok=True)
     num_cpus = max(1, multiprocessing.cpu_count() - 1)
     print(f"[RASTERIZE] {len(csvs)} CSV shards detected — using {num_cpus} workers.")
 
-    # Group all CSV shards by tag name (strip shard suffix)
+    # --- Group CSV shards by tag name (strip shard suffix) ---
     tag_groups = defaultdict(list)
     for csv_path in csvs:
         tag_base = re.sub(r"(_[0-9]{3})+$", "", csv_path.stem)
         tag_groups[tag_base].append(csv_path)
 
-    print(f"[RASTERIZE] {len(tag_groups)} unique tags found.")
+    tag_list = sorted(tag_groups.keys())
+    print(f"[RASTERIZE] {len(tag_list)} unique tags found.")
 
-    # Run in parallel per tag group
-    out_tifs = []
+    # --- Rasterize each tag into temporary single-band TIFF ---
+    tmp_rasters = []
     with ProcessPoolExecutor(max_workers=num_cpus) as exe:
         futures = {
             exe.submit(_rasterize_tag_group, tag, group, out_dir, bounds, res): tag
@@ -586,13 +586,40 @@ def rasterize_all_fast(
             tag = futures[f]
             result = f.result()
             if result:
-                out_tifs.append(result)
+                tmp_rasters.append(result)
             if i % 10 == 0 or i == len(futures):
                 print(f"[RASTERIZE] Completed {i}/{len(futures)} tags")
 
-    print(f"[RASTERIZE] Finished rasterizing {len(out_tifs)} tags for this tile.")
-    return out_tifs
+    if not tmp_rasters:
+        print("[RASTERIZE] No rasters produced for this tile.")
+        return None
 
+    # --- Combine all tag rasters into one multi-band TIFF ---
+    tile_multiband = out_dir / "tags_tile.tif"
+    print(f"[MERGE] Creating multi-band raster for {len(tmp_rasters)} tags → {tile_multiband.name}")
+
+    merge_cmd = [
+        "gdal_merge.py",
+        "-separate",
+        "-o", str(tile_multiband),
+        "-of", "GTiff",
+        "-co", "TILED=YES",
+        "-co", "BIGTIFF=YES",
+        "-co", "COMPRESS=LZW",
+        "-a_nodata", "0",
+    ] + [str(r) for r in tmp_rasters]
+
+    subprocess.run(merge_cmd, check=True)
+
+    # Optionally clean up temporary single-band rasters
+    for r in tmp_rasters:
+        try:
+            r.unlink()
+        except:
+            pass
+
+    print(f"[RASTERIZE] Multi-band raster created: {tile_multiband}")
+    return tile_multiband
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
@@ -688,16 +715,38 @@ def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
     print(f"[MERGE] Final merged raster: {out_path}")
 
 
-def sum_all_rasters(inputs: List[Path], out_path: Path):
+def sum_all_rasters(multiband_path: Path, out_path: Path):
     """
-    Wrapper that merges all tag-level rasters into the final infrastructure raster.
+    Sum all bands of a multi-band raster into a single-band TIFF.
+    Produces the final infra_tile_xxx.tif file.
     """
 
-    if not inputs:
-        print("[MERGE] No rasters to sum.")
+    if not multiband_path.exists():
+        print(f"[MERGE] Multi-band raster not found: {multiband_path}")
         return
-    print(f"[MERGE] Summing {len(inputs)} rasters into {out_path.name} (multi-threaded) ...")
-    _calc_sum_safe(inputs, out_path)
+
+    print(f"[MERGE] Summing all bands in {multiband_path.name} → {out_path.name}")
+
+    band_count = ds.RasterCount
+    ds = None
+    calc_expr = " + ".join([f"A{i+1}" for i in range(band_count)])
+
+    args = [
+        "gdal_calc.py",
+        "--overwrite",
+        f"--outfile={out_path}",
+        "--type=Byte",
+        "--calc", calc_expr,
+        f"-A={multiband_path}",
+        "--allBands=A",
+        "--co=COMPRESS=LZW",
+        "--co=TILED=YES",
+        "--co=BIGTIFF=YES",
+    ]
+    subprocess.run(args, check=True)
+    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
+    print(f"[MERGE] Infra raster created: {out_path}")
+
 
 def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir):
     """Merge all tile rasters for a tag into a global GeoTIFF using VRT + gdal_translate."""
@@ -1063,28 +1112,49 @@ def main():
                 split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
 
     with log_time("[4] Rasterize CSVs by tile (parallel within tiles)"):
+
         csv_files = list(csv_dir.glob("*.csv"))
         if not csv_files:
             print("[WARN] No CSV files to rasterize.")
         else:
-            tile_size = 30
+            tile_size = 60  # use 60° tiles to get ~18 global tiles
             tiles = generate_global_tiles(bounds, step=tile_size)
             print(f"[RASTERIZE] Splitting world into {len(tiles)} tiles of {tile_size}°×{tile_size}°")
 
             tile_outputs = []
             for i, tile_bounds in enumerate(tiles, 1):
-                print(f"[TILE {i}/{len(tiles)}] Processing bounds {tile_bounds}")
                 tile_dir = raster_dir / f"tile_{i:03d}"
                 tile_dir.mkdir(parents=True, exist_ok=True)
+                tile_out = tile_dir / f"infra_tile_{i:03d}.tif"
+                multiband_path = tile_dir / "tags_tile.tif"
+
+                # --- Skip if tile already processed ---
+                if tile_out.exists() and multiband_path.exists():
+                    print(f"[SKIP] Tile {i}/{len(tiles)} already rasterized ({tile_out.name}) — skipping.")
+                    tile_outputs.append(tile_out)
+                    continue
+
+                print(f"[TILE {i}/{len(tiles)}] Processing bounds {tile_bounds}")
 
                 try:
-                    tag_rasters = rasterize_all_fast(csv_files, tile_dir, tile_bounds, res, categories)
-                    tile_out = tile_dir / f"infra_tile_{i:03d}.tif"
-                    sum_all_rasters(tag_rasters, tile_out)
+                    # Rasterize all tag CSVs into a single multi-band raster for this tile
+                    multiband_tif = rasterize_all_fast(csv_files, tile_dir, tile_bounds, res, categories)
+
+                    # Skip if no raster created (e.g., empty region)
+                    if not multiband_tif or not multiband_tif.exists():
+                        print(f"[TILE {i}] No raster created — skipping.")
+                        continue
+
+                    # Sum all bands into one infrastructure raster for this tile
+                    sum_all_rasters(multiband_tif, tile_out)
                     tile_outputs.append(tile_out)
                     print(f"[TILE {i}] Completed and saved {tile_out.name}")
+
                 except Exception as e:
                     print(f"[TILE {i}] Failed: {e}")
+                    continue
+
+            print(f"[RASTERIZE] Completed {len(tile_outputs)}/{len(tiles)} tiles.")
 
     with log_time("[5a] Merge all tile rasters into global layer"):
         tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
@@ -1103,24 +1173,43 @@ def main():
             ] + [str(t) for t in tile_outputs], check=True)
             print(f"[MERGE] Global raster created: {merged_path}")
 
-    with log_time("[5b] Merge per-tag rasters across tiles into global tag layers"):
-        tiles_dir = raster_dir
-        output_dir = raster_dir  # keep globals here
-
-        # Collect unique tags from all tile rasters (skip infra tiles)
-        unique_tags = sorted({
-            p.stem for p in Path(tiles_dir).rglob("*.tif")
-            if not p.name.startswith("infra_tile")
-        })
-
-        if not unique_tags:
-            print("[MERGE] No per-tag rasters found to merge.")
+    with log_time("[5b] Merge all multi-band tag tiles into global multi-band raster"):
+        multiband_tiles = sorted(raster_dir.glob("tile_*/tags_tile.tif"))
+        if not multiband_tiles:
+            print("[MERGE] No multi-band rasters found.")
         else:
-            existing_globals = list(output_dir.glob("*_global.tif"))
-            if existing_globals:
-                print(f"[SKIP] Found {len(existing_globals)} global tag rasters — skipping merge.")
+            global_multiband = raster_dir / f"flii_tags_global_{year}_{res_m}m.tif"
+            if global_multiband.exists():
+                print(f"[SKIP] Global multi-band raster already exists: {global_multiband.name}")
             else:
-                merge_all_tags_parallel(unique_tags, tiles_dir, output_dir, max_workers=8)
+                print(f"[MERGE] Merging {len(multiband_tiles)} multi-band tiles → {global_multiband.name}")
+
+                # Build intermediate VRT (virtual mosaic)
+                vrt_path = raster_dir / "flii_tags_global_tmp.vrt"
+                buildvrt_cmd = [
+                    "gdalbuildvrt",
+                    "-separate",
+                    str(vrt_path),
+                ] + [str(t) for t in multiband_tiles]
+
+                # Translate VRT to compressed GeoTIFF
+                translate_cmd = [
+                    "gdal_translate",
+                    str(vrt_path),
+                    str(global_multiband),
+                    "-co", "TILED=YES",
+                    "-co", "BIGTIFF=YES",
+                    "-co", "COMPRESS=LZW",
+                    "-a_nodata", "0",
+                ]
+
+                try:
+                    subprocess.run(buildvrt_cmd, check=True)
+                    subprocess.run(translate_cmd, check=True)
+                    print(f"[MERGE] Created global multi-band raster: {global_multiband}")
+                finally:
+                    if vrt_path.exists():
+                        vrt_path.unlink(missing_ok=True)
 
     with log_time("[6] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
