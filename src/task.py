@@ -907,88 +907,102 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
 
     res_m = degrees_to_meters(res)
 
-    # Paths
-    merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
-    if not merged_candidate.exists():
-        print("[EXPORT WARN] Global merged raster not found yet.")
+    # --- Key expected rasters ---
+    merged_infra = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
+    multi_band = raster_dir / f"flii_tags_global_{year}_{res_m}m.tif"
+
+    if not merged_infra.exists():
+        print("[WARN] Global infrastructure raster not found.")
     else:
-        print(f"[EXPORT] Found global raster: {merged_candidate.name}")
+        print(f"[EXPORT] Found global infra raster: {merged_infra.name}")
 
-    # --- Collect tag rasters from all tiles ---
-    tile_tag_rasters = defaultdict(list)
-    for tif in raster_dir.rglob("*.tif"):
-        name = tif.name
-        if name.startswith("infra_tile"):
-            continue  # skip tile-level infra layers
-        if "tmp" in tif.name or tif.name.startswith("sum_"):
-            continue  # skip intermediate sums
-        tag_key = tif.stem
-        tile_tag_rasters[tag_key].append(tif)
+    if multi_band.exists():
+        print(f"[EXPORT] Found global multi-band tag raster: {multi_band.name}")
 
-    # --- Merge tag rasters across tiles into global tag rasters ---
-    global_tag_rasters = []
+    # --- Gather per-tag rasters (only used if not upload_merged_only) ---
+    tag_rasters = []
     if not upload_merged_only:
-        print(f"[EXPORT] Merging {len(tile_tag_rasters)} tag rasters across tiles → global layers")
-        for tag, rasters in tile_tag_rasters.items():
-            out_tif = raster_dir / f"{tag}.tif"
-            if len(rasters) == 1:
-                shutil.copy(rasters[0], out_tif)
-            else:
-                args = [
-                    "gdal_merge.py", "-o", str(out_tif),
-                    "-of", "GTiff",
-                    "-co", "TILED=YES",
-                    "-co", "COMPRESS=LZW",
-                    "-co", "BIGTIFF=YES",
-                    "-n", "0", "-a_nodata", "0",
-                ] + [str(p) for p in rasters]
-                subprocess.run(args, check=True)
-            global_tag_rasters.append(out_tif)
-        print(f"[EXPORT] Created {len(global_tag_rasters)} global tag rasters.")
+        for tif in raster_dir.glob("tile_*/[!infra]*.tif"):
+            tag_rasters.append(tif)
 
-    # --- Assemble upload list ---
-    if upload_merged_only:
-        if not merged_candidate.exists():
-            print("[EXPORT] No global raster found to upload in merged-only mode.")
-            return
-        tifs = [merged_candidate]
-        print("[EXPORT] Uploading only final infrastructure raster.")
-    else:
-        tifs = global_tag_rasters
-        if merged_candidate.exists():
-            tifs.append(merged_candidate)
-            print("[EXPORT] Including final infrastructure raster in upload set.")
+    # --- Build list of rasters to upload ---
+    to_upload = []
 
-    if not tifs:
+    if multi_band.exists():
+        to_upload.append(multi_band)
+    if merged_infra.exists():
+        to_upload.append(merged_infra)
+
+    if not upload_merged_only and tag_rasters:
+        to_upload.extend(tag_rasters)
+
+    if not to_upload:
         print("[EXPORT] No rasters found to export.")
         return
 
-    # --- Upload to GCS and GEE ---
+    # --- Upload & register each raster ---
     exported_assets = []
-    for tif in tifs:
+    for tif in to_upload:
+        # Destination paths
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
         safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
         asset_id = f"{EE_ASSET_ROOT}/{year}/{safe_stem}"
 
         try:
+            print(f"[UPLOAD] Uploading {tif.name} to {gcs_uri}")
             upload_to_gcs(tif, gcs_uri)
-            import_to_earth_engine(asset_id, gcs_uri)
+
+            # --- Handle multi-band specially (set band count) ---
+            bands = []
+            try:
+                ds = gdal.Open(str(tif))
+                band_count = ds.RasterCount if ds else 1
+                bands = [{"id": f"b{i+1}"} for i in range(band_count)]
+                ds = None
+            except Exception:
+                bands = [{"id": "b1"}]
+
+            print(f"[EE IMPORT] Importing {tif.name} ({len(bands)} bands) → {asset_id}")
+
+            ensure_ee_folder_exists("/".join(asset_id.split("/")[:-1]))
+
+            try:
+                ee.data.getAsset(asset_id)
+                print(f"[EE IMPORT] Asset already exists: {asset_id} — skipping.")
+                continue
+            except ee.ee_exception.EEException:
+                pass
+
+            props = {"year": year, "resolution_m": res_m}
+            params = {
+                "id": asset_id,
+                "tilesets": [{"sources": [{"uris": [gcs_uri]}]}],
+                "bands": bands,
+                "pyramidingPolicy": "MEAN",
+                "properties": props,
+            }
+
+            task = ee.data.startIngestion(str(uuid.uuid4()), params)
+            print(f"[EE IMPORT] Ingestion started: {task['id']}")
+
             exported_assets.append({
                 "filename": tif.name,
                 "asset_id": asset_id,
                 "gcs_uri": gcs_uri,
-                "status": "imported"
-            })
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Failed for {tif.name}: {e}")
-            exported_assets.append({
-                "filename": tif.name,
-                "asset_id": asset_id,
-                "gcs_uri": gcs_uri,
-                "status": f"failed - {e}"
+                "bands": len(bands),
+                "status": "imported",
             })
 
-    # --- Save export metadata ---
+        except Exception as e:
+            print(f"[ERROR] Failed to upload/import {tif.name}: {e}")
+            exported_assets.append({
+                "filename": tif.name,
+                "asset_id": asset_id,
+                "gcs_uri": gcs_uri,
+                "status": f"failed - {e}",
+            })
+
+    # --- Save metadata locally & to GCS ---
     metadata_path = raster_dir / f"gee_export_metadata_{year}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(exported_assets, f, indent=2)
@@ -1000,7 +1014,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
     except subprocess.CalledProcessError as e:
         print(f"[WARN] Could not upload metadata to GCS: {e}")
 
-    # --- Upload OSM metadata ---
+    # --- Upload OSM metadata if available ---
     osm_meta_path = raster_dir.parent / "osm_download_metadata.json"
     if osm_meta_path.exists():
         osm_gcs_uri = f"gs://{GCS_BUCKET}/{year}/osm_download_metadata.json"
@@ -1009,9 +1023,6 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
             print(f"[METADATA] Uploaded OSM metadata to GCS: {osm_gcs_uri}")
         except subprocess.CalledProcessError as e:
             print(f"[WARN] Could not upload OSM metadata to GCS: {e}")
-    else:
-        print("[WARN] No OSM metadata file found to upload.")
-
 
 def cleanup_intermediates(year_dir: Path):
     """
@@ -1116,13 +1127,14 @@ def main():
                 print("[SPLIT] No CSVs found — generating from text...")
                 split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
 
-    with log_time("[4] Rasterize CSVs by tile (parallel within tiles)"):
+
+    with log_time("[4] Rasterize CSVs by tile (single-band rasters per tag)"):
 
         csv_files = list(csv_dir.glob("*.csv"))
         if not csv_files:
             print("[WARN] No CSV files to rasterize.")
         else:
-            tile_size = 60  # use 60° tiles to get ~18 global tiles
+            tile_size = 60  # ~18 global tiles
             tiles = generate_global_tiles(bounds, step=tile_size)
             print(f"[RASTERIZE] Splitting world into {len(tiles)} tiles of {tile_size}°×{tile_size}°")
 
@@ -1131,10 +1143,9 @@ def main():
                 tile_dir = raster_dir / f"tile_{i:03d}"
                 tile_dir.mkdir(parents=True, exist_ok=True)
                 tile_out = tile_dir / f"infra_tile_{i:03d}.tif"
-                multiband_path = tile_dir / "tags_tile.tif"
 
-                # --- Skip if tile already processed ---
-                if tile_out.exists() and multiband_path.exists():
+                # --- Skip if tile already exists ---
+                if tile_out.exists():
                     print(f"[SKIP] Tile {i}/{len(tiles)} already rasterized ({tile_out.name}) — skipping.")
                     tile_outputs.append(tile_out)
                     continue
@@ -1142,16 +1153,54 @@ def main():
                 print(f"[TILE {i}/{len(tiles)}] Processing bounds {tile_bounds}")
 
                 try:
-                    # Rasterize all tag CSVs into a single multi-band raster for this tile
-                    multiband_tif = rasterize_all_fast(csv_files, tile_dir, tile_bounds, res, categories)
+                    # Group CSV shards by tag (strip shard suffix)
+                    tag_groups = defaultdict(list)
+                    for csv_path in csv_files:
+                        tag_base = re.sub(r"(_[0-9]{3})+$", "", csv_path.stem)
+                        tag_groups[tag_base].append(csv_path)
 
-                    # Skip if no raster created (e.g., empty region)
-                    if not multiband_tif or not multiband_tif.exists():
-                        print(f"[TILE {i}] No raster created — skipping.")
+                    # Parallel rasterization (each tag → single-band raster)
+                    num_cpus = max(1, multiprocessing.cpu_count() - 1)
+                    print(f"[RASTERIZE] {len(tag_groups)} unique tags found — using {num_cpus} workers.")
+
+                    def _rasterize_tag(tag, csv_group):
+                        safe_tag = re.sub(r"[=:/@]", "_", tag)
+                        out_tif = tile_dir / f"{safe_tag}.tif"
+                        if out_tif.exists():
+                            return out_tif
+                        subprocess.run([
+                            "gdal_rasterize",
+                            "-a", "BURN",
+                            "-a_srs", "EPSG:4326",
+                            "-ot", "Byte",
+                            "-te", *map(str, tile_bounds),
+                            "-tr", str(res), str(res),
+                            "-a_nodata", "0",
+                            "-co", "TILED=YES",
+                            "-co", "BIGTIFF=YES",
+                            "-co", "COMPRESS=NONE",
+                            f"CSV:{csv_group[0]}",
+                            str(out_tif)
+                        ], check=True)
+                        return out_tif
+
+                    with ProcessPoolExecutor(max_workers=num_cpus) as exe:
+                        futures = [exe.submit(_rasterize_tag, t, g) for t, g in tag_groups.items()]
+                        for j, f in enumerate(as_completed(futures), 1):
+                            try:
+                                f.result()
+                            except Exception as e:
+                                print(f"[TILE {i}] Tag rasterization failed: {e}")
+                            if j % 10 == 0 or j == len(futures):
+                                print(f"[TILE {i}] {j}/{len(futures)} tags rasterized.")
+
+                    # --- Merge all tag rasters for this tile into a summed infrastructure layer ---
+                    tag_tifs = list(tile_dir.glob("*.tif"))
+                    if not tag_tifs:
+                        print(f"[TILE {i}] No rasters produced — skipping.")
                         continue
 
-                    # Sum all bands into one infrastructure raster for this tile
-                    sum_all_rasters(multiband_tif, tile_out)
+                    _calc_sum_safe(tag_tifs, tile_out)
                     tile_outputs.append(tile_out)
                     print(f"[TILE {i}] Completed and saved {tile_out.name}")
 
@@ -1161,7 +1210,8 @@ def main():
 
             print(f"[RASTERIZE] Completed {len(tile_outputs)}/{len(tiles)} tiles.")
 
-    with log_time("[5a] Merge all tile rasters into global layer"):
+    # (a) Merge per-tile infrastructure rasters into global infra layer
+    with log_time("[5a] Merge tile infrastructure rasters into global layer"):
         tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
         if not tile_outputs:
             print("[WARN] No tile rasters found for merging.")
@@ -1178,43 +1228,32 @@ def main():
             ] + [str(t) for t in tile_outputs], check=True)
             print(f"[MERGE] Global raster created: {merged_path}")
 
-    with log_time("[5b] Merge all multi-band tag tiles into global multi-band raster"):
-        multiband_tiles = sorted(raster_dir.glob("tile_*/tags_tile.tif"))
-        if not multiband_tiles:
-            print("[MERGE] No multi-band rasters found.")
+    # (b) Stack all tag rasters (after merging per-tag across tiles)
+    with log_time("[5b] Stack all tag rasters into global multi-band raster"):
+        tag_rasters = sorted(raster_dir.glob("*_global.tif"))
+        if not tag_rasters:
+            print("[MERGE] No tag rasters found to stack.")
         else:
             global_multiband = raster_dir / f"flii_tags_global_{year}_{res_m}m.tif"
             if global_multiband.exists():
                 print(f"[SKIP] Global multi-band raster already exists: {global_multiband.name}")
             else:
-                print(f"[MERGE] Merging {len(multiband_tiles)} multi-band tiles → {global_multiband.name}")
-
-                # Build intermediate VRT (virtual mosaic)
                 vrt_path = raster_dir / "flii_tags_global_tmp.vrt"
-                buildvrt_cmd = [
-                    "gdalbuildvrt",
-                    "-separate",
-                    str(vrt_path),
-                ] + [str(t) for t in multiband_tiles]
-
-                # Translate VRT to compressed GeoTIFF
-                translate_cmd = [
-                    "gdal_translate",
-                    str(vrt_path),
-                    str(global_multiband),
+                print(f"[STACK] Stacking {len(tag_rasters)} rasters → {global_multiband.name}")
+                subprocess.run(
+                    ["gdalbuildvrt", "-separate", str(vrt_path)] + [str(r) for r in tag_rasters],
+                    check=True
+                )
+                subprocess.run([
+                    "gdal_translate", str(vrt_path), str(global_multiband),
                     "-co", "TILED=YES",
                     "-co", "BIGTIFF=YES",
                     "-co", "COMPRESS=LZW",
-                    "-a_nodata", "0",
-                ]
+                    "-a_nodata", "0"
+                ], check=True)
+                vrt_path.unlink(missing_ok=True)
+                print(f"[STACK] Created global multi-band raster: {global_multiband}")
 
-                try:
-                    subprocess.run(buildvrt_cmd, check=True)
-                    subprocess.run(translate_cmd, check=True)
-                    print(f"[MERGE] Created global multi-band raster: {global_multiband}")
-                finally:
-                    if vrt_path.exists():
-                        vrt_path.unlink(missing_ok=True)
 
     with log_time("[6] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
