@@ -486,6 +486,26 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
         x += step
     return tiles
 
+def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
+    safe_tag = re.sub(r"[=:/@]", "_", tag)
+    out_tif = tile_dir / f"{safe_tag}.tif"
+    if out_tif.exists():
+        return out_tif
+    subprocess.run([
+        "gdal_rasterize",
+        "-a", "BURN",
+        "-a_srs", "EPSG:4326",
+        "-ot", "Byte",
+        "-te", *map(str, tile_bounds),
+        "-tr", str(res), str(res),
+        "-a_nodata", "0",
+        "-co", "TILED=YES",
+        "-co", "BIGTIFF=YES",
+        "-co", "COMPRESS=NONE",
+        f"CSV:{csv_group[0]}",
+        str(out_tif)
+    ], check=True)
+    return out_tif
 
 def _rasterize_tag_group(
     tag: str,
@@ -1163,29 +1183,11 @@ def main():
                     num_cpus = max(1, multiprocessing.cpu_count() - 1)
                     print(f"[RASTERIZE] {len(tag_groups)} unique tags found — using {num_cpus} workers.")
 
-                    def _rasterize_tag(tag, csv_group):
-                        safe_tag = re.sub(r"[=:/@]", "_", tag)
-                        out_tif = tile_dir / f"{safe_tag}.tif"
-                        if out_tif.exists():
-                            return out_tif
-                        subprocess.run([
-                            "gdal_rasterize",
-                            "-a", "BURN",
-                            "-a_srs", "EPSG:4326",
-                            "-ot", "Byte",
-                            "-te", *map(str, tile_bounds),
-                            "-tr", str(res), str(res),
-                            "-a_nodata", "0",
-                            "-co", "TILED=YES",
-                            "-co", "BIGTIFF=YES",
-                            "-co", "COMPRESS=NONE",
-                            f"CSV:{csv_group[0]}",
-                            str(out_tif)
-                        ], check=True)
-                        return out_tif
-
-                    with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-                        futures = [exe.submit(_rasterize_tag, t, g) for t, g in tag_groups.items()]
+                    with ThreadPoolExecutor(max_workers=num_cpus) as exe:
+                        futures = [
+                            exe.submit(_rasterize_tag, t, g, tile_dir, tile_bounds, res)
+                            for t, g in tag_groups.items()
+                        ]
                         for j, f in enumerate(as_completed(futures), 1):
                             try:
                                 f.result()
