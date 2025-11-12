@@ -602,45 +602,6 @@ def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
     shutil.rmtree(tmp_dir, ignore_errors=True)
     print(f"[MERGE] Final merged raster: {out_path}")
 
-
-def sum_all_rasters(multiband_path: Path, out_path: Path):
-    """
-    Sum all bands of a multi-band raster into a single-band TIFF.
-    Produces the final infra_tile_xxx.tif file.
-    """
-    if not multiband_path.exists():
-        print(f"[MERGE] Multi-band raster not found: {multiband_path}")
-        return
-
-    print(f"[MERGE] Summing all bands in {multiband_path.name} → {out_path.name}")
-
-    # Determine actual band count dynamically
-    ds = gdal.Open(str(multiband_path))
-    if ds is None:
-        print(f"[ERROR] Could not open raster: {multiband_path}")
-        return
-    band_count = ds.RasterCount
-    ds = None
-
-    calc_expr = " + ".join([f"A{i+1}" for i in range(band_count)])
-
-    args = [
-        "gdal_calc.py",
-        "--overwrite",
-        f"--outfile={out_path}",
-        "--type=Byte",
-        "--calc", calc_expr,
-        f"-A={multiband_path}",
-        "--allBands=A",
-        "--co=COMPRESS=LZW",
-        "--co=TILED=YES",
-        "--co=BIGTIFF=YES",
-    ]
-    subprocess.run(args, check=True)
-    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
-    print(f"[MERGE] Infra raster created: {out_path}")
-
-
 def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir, year=None, res_m=None):
     """
     Merge all tile rasters for a tag into a global GeoTIFF using VRT + gdal_translate.
@@ -676,7 +637,7 @@ def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir, year=None, res_m=None
     buildvrt_cmd = ["gdalbuildvrt", str(vrt_path)] + [str(f) for f in input_tifs]
     translate_cmd = [
         "gdal_translate", str(vrt_path), str(out_tif),
-        "-co", "COMPRESS=LZW",
+        "-co", "COMPRESS=NONE",
         "-co", "BIGTIFF=YES",
         "-co", "TILED=YES",
         "-a_nodata", "none"
@@ -1098,7 +1059,7 @@ def main():
                     "-co", "TILED=YES",
                     "-co", "BLOCKXSIZE=1024",
                     "-co", "BLOCKYSIZE=1024",
-                    "-co", "COMPRESS=LZW",
+                    "-co", "COMPRESS=NONE",
                     "-co", "BIGTIFF=YES"
                 ] + [str(t) for t in tile_outputs], check=True)
                 print(f"[MERGE] Global raster created: {merged_path}")
