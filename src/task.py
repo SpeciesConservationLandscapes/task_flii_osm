@@ -495,7 +495,8 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
         "gdal_rasterize",
         "-a", "BURN",
         "-a_srs", "EPSG:4326",
-        "-ot", "Byte",
+        "-ot", "UInt16",
+        "-at",
         "-te", *map(str, tile_bounds),
         "-tr", str(res), str(res),
         "-init", "0",
@@ -532,7 +533,7 @@ def _calc_sum(inputs: List[Path], out_path: Path):
     args = [
         "gdal_calc.py", "--quiet", "--overwrite",
         f"--outfile={str(out_path)}",
-        "--type=Byte",
+        "--type=UInt16",
         "--calc", calc_expr,
         "--co=COMPRESS=NONE",
         "--co=BIGTIFF=YES",
@@ -711,50 +712,6 @@ def ensure_ee_folder_exists(folder_path: str):
             ensure_ee_folder_exists(parent)
         print(f"[EE FOLDER] Creating: {folder_path}")
         ee.data.createAsset({'type': 'Folder'}, folder_path)
-
-def import_to_earth_engine(asset_id: str, gcs_uri: str):
-    """
-    Given a GCS URI and desired asset ID, tell Earth Engine
-    to ingest the raster as an asset.
-    Uses the GEE REST ingestion API (ee.data.startIngestion).
-    """
-
-    print(f"[EE IMPORT] {gcs_uri} → {asset_id}")
-    try:
-        folder_path = "/".join(asset_id.split("/")[:-1])
-        ensure_ee_folder_exists(folder_path)
-        try:
-            ee.data.getAsset(asset_id)
-            print(f"[EE IMPORT] Asset already exists: {asset_id} — skipping upload.")
-            return
-        except ee.ee_exception.EEException:
-            pass
-
-        # Extract resolution if encoded in filename (e.g., *_300m.tif)
-        res_match = re.search(r"_(\d{2,4})m", asset_id)
-        res_m = int(res_match.group(1)) if res_match else None
-
-        # Build properties safely
-        props = {}
-        year_match = re.search(r"/(\d{4})/", asset_id)
-        if year_match:
-            props["year"] = int(year_match.group(1))
-        if res_m is not None:
-            props["resolution_m"] = int(res_m)
-
-        params = {
-            "id": asset_id,
-            "tilesets": [{"sources": [{"uris": [gcs_uri]}]}],
-            "bands": [{"id": "b1"}],
-            "pyramidingPolicy": "MEAN",
-            "properties": props
-        }
-
-        task = ee.data.startIngestion(str(uuid.uuid4()), params)
-        print(f"[EE IMPORT] Ingestion task started: {task['id']}")
-    except Exception as e:
-        print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
-        raise
 
 def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
