@@ -464,10 +464,10 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     print(f"[SPLIT] {txt_file.name} → {len(out_paths)} CSV shards written to {csv_dir}")
     return out_paths
 
-def generate_global_tiles(bounds=(-180, -90, 180, 90), step=30):
+def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
     """
     Generate a list of (xmin, ymin, xmax, ymax) tiles covering the global extent.
-    The 'step' defines the tile size in degrees (e.g., 10, 20, 30).
+    The 'step' defines the tile size in degrees.
     Each tile will be aligned on whole degree boundaries for consistency.
     """
     xmin, ymin, xmax, ymax = bounds
