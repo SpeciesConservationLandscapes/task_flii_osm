@@ -1241,34 +1241,6 @@ def main():
 
         merge_all_tags_parallel(tags, raster_dir, raster_dir)
 
-
-    # Stack all tag rasters (after merging per-tag across tiles)
-    with log_time("[5c] Stack all tag rasters into global multi-band raster"):
-        tag_rasters = sorted(raster_dir.glob("*_global.tif"))
-        if not tag_rasters:
-            print("[MERGE] No tag rasters found to stack.")
-        else:
-            global_multiband = raster_dir / f"flii_tags_global_{year}_{res_m}m.tif"
-            if global_multiband.exists():
-                print(f"[SKIP] Global multi-band raster already exists: {global_multiband.name}")
-            else:
-                vrt_path = raster_dir / "flii_tags_global_tmp.vrt"
-                print(f"[STACK] Stacking {len(tag_rasters)} rasters → {global_multiband.name}")
-                subprocess.run(
-                    ["gdalbuildvrt", "-separate", str(vrt_path)] + [str(r) for r in tag_rasters],
-                    check=True
-                )
-                subprocess.run([
-                    "gdal_translate", str(vrt_path), str(global_multiband),
-                    "-co", "TILED=YES",
-                    "-co", "BIGTIFF=YES",
-                    "-co", "COMPRESS=LZW",
-                    "-a_nodata", "0"
-                ], check=True)
-                vrt_path.unlink(missing_ok=True)
-                print(f"[STACK] Created global multi-band raster: {global_multiband}")
-
-
     with log_time("[6] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
         export_rasters_to_gee(raster_dir, year, res, upload_merged_only)
