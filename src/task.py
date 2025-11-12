@@ -720,15 +720,20 @@ def sum_all_rasters(multiband_path: Path, out_path: Path):
     Sum all bands of a multi-band raster into a single-band TIFF.
     Produces the final infra_tile_xxx.tif file.
     """
-
     if not multiband_path.exists():
         print(f"[MERGE] Multi-band raster not found: {multiband_path}")
         return
 
     print(f"[MERGE] Summing all bands in {multiband_path.name} → {out_path.name}")
 
+    # Determine actual band count dynamically
+    ds = gdal.Open(str(multiband_path))
+    if ds is None:
+        print(f"[ERROR] Could not open raster: {multiband_path}")
+        return
     band_count = ds.RasterCount
     ds = None
+
     calc_expr = " + ".join([f"A{i+1}" for i in range(band_count)])
 
     args = [
