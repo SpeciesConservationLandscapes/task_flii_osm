@@ -498,148 +498,16 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
         "-ot", "Byte",
         "-te", *map(str, tile_bounds),
         "-tr", str(res), str(res),
-        "-a_nodata", "255",
+        "-init", "0",
         "-co", "TILED=YES",
         "-co", "BIGTIFF=YES",
         "-co", "COMPRESS=NONE",
         f"CSV:{csv_group[0]}",
         str(out_tif)
     ], check=True)
+
     return out_tif
 
-def _rasterize_tag_group(
-    tag: str,
-    shard_csvs: List[Path],
-    out_dir: Path,
-    bounds: Tuple[float, float, float, float],
-    res: float
-) -> Optional[Path]:
-    """
-    Rasterize all CSV shards for a tag into one .tif for the given tile.
-
-    Each CSV contains 'WKT' and 'BURN' fields. The BURN value is rasterized as pixel value.
-    This function merges multiple CSV shards for the same tag into one raster per tile.
-    """
-    try:
-        safe_tag = re.sub(r"[=:/@]", "_", tag)
-        out_tif = out_dir / f"{safe_tag}.tif"
-
-        # Temporary intermediate rasters (one per shard)
-        shard_tifs = []
-
-        for csv_file in shard_csvs:
-            shard_tif = out_dir / f"{csv_file.stem}.tif"
-
-            subprocess.run([
-                "gdal_rasterize",
-                "-a", "BURN",
-                "-a_srs", "EPSG:4326",
-                "-ot", "Byte",
-                "-te", *map(str, bounds),
-                "-tr", str(res), str(res),
-                "-a_nodata", "255",
-                "-co", "TILED=YES",
-                "-co", "COMPRESS=NONE",
-                "-co", "BIGTIFF=YES",
-                f"CSV:{csv_file}",
-                str(shard_tif)
-            ], check=True)
-
-            shard_tifs.append(shard_tif)
-
-        # Merge shards for this tag into one final .tif
-        if len(shard_tifs) > 1:
-            args = [
-                "gdal_merge.py", "-o", str(out_tif),
-                "-of", "GTiff",
-                "-co", "TILED=YES",
-                "-co", "BIGTIFF=YES",
-                "-n", "0", "-a_nodata", "0",
-            ] + [str(p) for p in shard_tifs]
-            subprocess.run(args, check=True)
-            for t in shard_tifs:
-                t.unlink(missing_ok=True)
-        else:
-            shutil.move(str(shard_tifs[0]), str(out_tif))
-
-        return out_tif
-
-    except Exception as e:
-        print(f"[RASTERIZE] Failed for {tag}: {e}")
-        return None
-
-
-def rasterize_all_fast(
-    csvs: List[Path],
-    out_dir: Path,
-    bounds: Tuple[float, float, float, float],
-    res: float,
-    config: dict
-) -> Optional[Path]:
-    """
-    Rasterize all tag CSVs into a single multi-band GeoTIFF for this tile.
-    Each tag becomes one band. Also returns the list of tag names for reference.
-    """
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    num_cpus = max(1, multiprocessing.cpu_count() - 1)
-    print(f"[RASTERIZE] {len(csvs)} CSV shards detected — using {num_cpus} workers.")
-
-    # --- Group CSV shards by tag name (strip shard suffix) ---
-    tag_groups = defaultdict(list)
-    for csv_path in csvs:
-        tag_base = re.sub(r"(_[0-9]{3})+$", "", csv_path.stem)
-        tag_groups[tag_base].append(csv_path)
-
-    tag_list = sorted(tag_groups.keys())
-    print(f"[RASTERIZE] {len(tag_list)} unique tags found.")
-
-    # --- Rasterize each tag into temporary single-band TIFF ---
-    tmp_rasters = []
-    with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        futures = {
-            exe.submit(_rasterize_tag_group, tag, group, out_dir, bounds, res): tag
-            for tag, group in tag_groups.items()
-        }
-
-        for i, f in enumerate(as_completed(futures), 1):
-            tag = futures[f]
-            result = f.result()
-            if result:
-                tmp_rasters.append(result)
-            if i % 10 == 0 or i == len(futures):
-                print(f"[RASTERIZE] Completed {i}/{len(futures)} tags")
-
-    if not tmp_rasters:
-        print("[RASTERIZE] No rasters produced for this tile.")
-        return None
-
-    # --- Combine all tag rasters into one multi-band TIFF ---
-    tile_multiband = out_dir / "tags_tile.tif"
-    print(f"[MERGE] Creating multi-band raster for {len(tmp_rasters)} tags → {tile_multiband.name}")
-
-    merge_cmd = [
-        "gdal_merge.py",
-        "-separate",
-        "-o", str(tile_multiband),
-        "-of", "GTiff",
-        "-co", "TILED=YES",
-        "-co", "BIGTIFF=YES",
-        "-co", "COMPRESS=LZW",
-        "-a_nodata", "0",
-    ] + [str(r) for r in tmp_rasters]
-
-    subprocess.run(merge_cmd, check=True)
-
-    # Optionally clean up temporary single-band rasters
-    for r in tmp_rasters:
-        try:
-            r.unlink()
-        except:
-            pass
-
-    print(f"[RASTERIZE] Multi-band raster created: {tile_multiband}")
-    return tile_multiband
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
@@ -774,21 +642,29 @@ def sum_all_rasters(multiband_path: Path, out_path: Path):
 
 
 def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir):
-    """Merge all tile rasters for a tag into a global GeoTIFF using VRT + gdal_translate."""
-    input_tifs = sorted(Path(tiles_dir).rglob(f"*/{tag}.tif"))
+    """
+    Merge all tile rasters for a tag into a global GeoTIFF using VRT + gdal_translate.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Match both tag.tif and tag_###.tif (handles global and AOI cases)
+    input_tifs = sorted(Path(tiles_dir).rglob(f"*/{tag}*.tif"))
     if not input_tifs:
         print(f"[SKIP] No rasters found for tag {tag}")
         return tag, None
 
-    vrt_path = Path(output_dir) / f"{tag}.vrt"
-    out_tif = Path(output_dir) / f"{tag}_global.tif"
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    vrt_path = output_dir / f"{tag}.vrt"
+    out_tif = output_dir / f"{tag}_global.tif"
 
-    # Skip if already created (resume-safe)
+    # Resume-safe: skip if already done
     if out_tif.exists():
         print(f"[SKIP] Already merged {tag}")
         return tag, out_tif
+
+    # Clean up any old vrt before rebuilding
+    if vrt_path.exists():
+        vrt_path.unlink()
 
     buildvrt_cmd = ["gdalbuildvrt", str(vrt_path)] + [str(f) for f in input_tifs]
     translate_cmd = [
@@ -796,7 +672,7 @@ def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir):
         "-co", "COMPRESS=LZW",
         "-co", "BIGTIFF=YES",
         "-co", "TILED=YES",
-        "-a_nodata", "0"
+        "-a_nodata", "none"
     ]
 
     try:
@@ -804,10 +680,9 @@ def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir):
         subprocess.run(translate_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print(f"[MERGE OK] {tag} → {out_tif}")
         return tag, out_tif
-    except subprocess.CalledProcessError:
-        print(f"[MERGE FAIL] {tag}")
+    except subprocess.CalledProcessError as e:
+        print(f"[MERGE FAIL] {tag}: {e}")
         return tag, None
-
 
 def merge_all_tags_parallel(tags, tiles_dir, output_dir, max_workers=None):
     """Run VRT-based merges for all tags in parallel."""
