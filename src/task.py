@@ -942,7 +942,7 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
     # --- Gather per-tag rasters (only used if not upload_merged_only) ---
     tag_rasters = []
     if not upload_merged_only:
-        for tif in raster_dir.glob("tile_*/[!infra]*.tif"):
+        for tif in raster_dir.glob("*_global.tif"):
             tag_rasters.append(tif)
 
     # --- Build list of rasters to upload ---
