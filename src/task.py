@@ -1212,7 +1212,7 @@ def main():
 
             print(f"[RASTERIZE] Completed {len(tile_outputs)}/{len(tiles)} tiles.")
 
-    # (a) Merge per-tile infrastructure rasters into global infra layer
+    # Merge per-tile infrastructure rasters into global infra layer
     with log_time("[5a] Merge tile infrastructure rasters into global layer"):
         tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
         if not tile_outputs:
@@ -1230,8 +1230,20 @@ def main():
             ] + [str(t) for t in tile_outputs], check=True)
             print(f"[MERGE] Global raster created: {merged_path}")
 
-    # (b) Stack all tag rasters (after merging per-tag across tiles)
-    with log_time("[5b] Stack all tag rasters into global multi-band raster"):
+    # Merge per-tag rasters across tiles into global rasters
+    with log_time("[5b] Merge per-tag rasters across tiles"):
+        # Get all tag names from the first tile folder
+        first_tile = next(raster_dir.glob("tile_*"))
+        tags = sorted(
+            [p.stem for p in first_tile.glob("*.tif") if not p.name.startswith("infra_")]
+        )
+        print(f"[MERGE] Found {len(tags)} tags to merge across tiles.")
+
+        merge_all_tags_parallel(tags, raster_dir, raster_dir)
+
+
+    # Stack all tag rasters (after merging per-tag across tiles)
+    with log_time("[5c] Stack all tag rasters into global multi-band raster"):
         tag_rasters = sorted(raster_dir.glob("*_global.tif"))
         if not tag_rasters:
             print("[MERGE] No tag rasters found to stack.")
