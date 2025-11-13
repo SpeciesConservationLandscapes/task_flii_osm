@@ -21,8 +21,11 @@ import time
 from contextlib import contextmanager
 import math
 from tqdm import tqdm
-import itertools
 import multiprocessing
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+
 
 # ------------
 # GDAL CONFIG 
@@ -464,6 +467,9 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     print(f"[SPLIT] {txt_file.name} → {len(out_paths)} CSV shards written to {csv_dir}")
     return out_paths
 
+def strip_shard_suffix(name):
+    return re.sub(r"(_[0-9]{3})+$", "", name)
+
 def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
     """
     Generate a list of (xmin, ymin, xmax, ymax) tiles covering the global extent.
@@ -486,236 +492,280 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
         x += step
     return tiles
 
+def snap_bounds(bounds, res):
+    xmin, ymin, xmax, ymax = bounds
+    xmin = math.floor(xmin / res) * res
+    ymin = math.floor(ymin / res) * res
+    xmax = math.ceil(xmax / res) * res
+    ymax = math.ceil(ymax / res) * res
+    return xmin, ymin, xmax, ymax
+
+def generate_snapped_tiles(bounds, tile_deg):
+    xmin, ymin, xmax, ymax = bounds
+    tiles = []
+    x = xmin
+    while x < xmax:
+        y = ymin
+        while y < ymax:
+            tiles.append((x, y, x + tile_deg, y + tile_deg))
+            y += tile_deg
+        x += tile_deg
+    return tiles
+
 def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
     """
-    Rasterize CSV shards for each tag.
-    Each shard -> its own raster, then summed into final <tag>.tif.
+    Rasterize all CSV shards belonging to a single tag into individual TIFFs
+    inside this tile directory.
     """
 
     safe_tag = re.sub(r"[=:/@]", "_", tag)
-    out_tif = tile_dir / f"{safe_tag}.tif"
-    if out_tif.exists():
-        return out_tif
+    tile_dir = Path(tile_dir)
+    tile_dir.mkdir(parents=True, exist_ok=True)
+
+    xmin, ymin, xmax, ymax = tile_bounds
+
+    # Compute exact number of pixels 
+    px_w = int(round((xmax - xmin) / res))
+    px_h = int(round((ymax - ymin) / res))
+
+    if px_w <= 0 or px_h <= 0:
+        raise ValueError(f"Invalid tile dims for {tag}: {px_w}×{px_h} from {tile_bounds}")
 
     shard_rasters = []
 
-    # Rasterize each CSV shard separately
+    # Rasterize each shard independently
     for shard_csv in sorted(csv_group):
-        shard_name = Path(shard_csv).stem
+        shard_name = Path(shard_csv).stem     # e.g., highway_residential_002
         shard_tif = tile_dir / f"{shard_name}.tif"
 
-        # Skip if the shard already rasterized
         if not shard_tif.exists():
-            subprocess.run([
+            cmd = [
                 "gdal_rasterize",
+                "-q", 
                 "-a", "BURN",
                 "-a_srs", "EPSG:4326",
                 "-ot", "Byte",
-                "-te", *map(str, tile_bounds),
-                "-tr", str(res), str(res),
+                "-te", str(xmin), str(ymin), str(xmax), str(ymax),
+                "-ts", str(px_w), str(px_h),
                 "-init", "0",
                 "-co", "TILED=YES",
+                "-co", "BLOCKXSIZE=256",
+                "-co", "BLOCKYSIZE=256",
                 "-co", "BIGTIFF=YES",
-                "-co", "COMPRESS=NONE",
+                "-co", "COMPRESS=DEFLATE",
                 f"CSV:{shard_csv}",
                 str(shard_tif)
-            ], check=True)
+            ]
+
+            # Run GDAL
+            subprocess.run(cmd, check=True)
 
         shard_rasters.append(shard_tif)
 
-    # If only one raster, no need to merge/sum
-    if len(shard_rasters) == 1:
-        shutil.copy(shard_rasters[0], out_tif)
-        subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_tif)], check=True)
-        return out_tif
+    return shard_rasters
 
-    # Sum all shard tif's into final tag tif
-    _calc_sum_safe(shard_rasters, out_tif)
+def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_transform):
+    """
+    Mosaic many tile rasters of the same tag into a single global raster.
 
+    - Each tile is already on the same grid (same resolution / CRS).
+    - Tiles are placed into the correct global window based on their transform.
+    - Overlaps (if any) are summed; non-overlapping tiles just fill their own area.
+    """
+
+    if not tile_tifs:
+        raise ValueError("No rasters provided for mosaic.")
+
+    # Use the first tile as a template for profile / CRS / datatype
+    with rasterio.open(tile_tifs[0]) as src0:
+        profile = src0.profile.copy()
+        crs = src0.crs
+        dtype = "uint8" 
+
+    profile.update(
+        width=global_width,
+        height=global_height,
+        transform=global_transform,
+        dtype=dtype,
+        nodata=None,
+        compress="DEFLATE",
+        bigtiff="YES",
+        tiled=True,
+    )
+
+    # 1) Create the (empty) global dataset
+    with rasterio.open(out_tif, "w", **profile):
+        pass  # just create; data will default to 0
+
+    # 2) Reopen in read/write mode and stream tiles in
+    with rasterio.open(out_tif, "r+") as dst:
+        for tif in tile_tifs:
+            with rasterio.open(tif) as src:
+                if src.crs != crs:
+                    raise ValueError(f"CRS mismatch for {tif}: {src.crs} vs {crs}")
+
+                left, bottom, right, top = src.bounds
+                tile_h, tile_w = src.height, src.width
+
+                # Upper-left pixel in the global grid
+                row_ul, col_ul = rasterio.transform.rowcol(global_transform, left, top)
+
+                # Choose block size (use source blocks if available)
+                if src.block_shapes and len(src.block_shapes) > 0:
+                    block_h, block_w = src.block_shapes[0]
+                else:
+                    block_h, block_w = 256, 256
+
+                for r_off in range(0, tile_h, block_h):
+                    for c_off in range(0, tile_w, block_w):
+                        h = min(block_h, tile_h - r_off)
+                        w = min(block_w, tile_w - c_off)
+
+                        # Corresponding position in global grid
+                        global_row = row_ul + r_off
+                        global_col = col_ul + c_off
+
+                        # Clip to global bounds (important when tiles extend beyond AOI)
+                        if global_row >= global_height or global_col >= global_width:
+                            continue
+
+                        h_clip = min(h, global_height - global_row)
+                        w_clip = min(w, global_width - global_col)
+                        if h_clip <= 0 or w_clip <= 0:
+                            continue
+
+                        src_window = Window(c_off, r_off, w_clip, h_clip)
+                        dst_window = Window(global_col, global_row, w_clip, h_clip)
+
+                        data = src.read(1, window=src_window, masked=True).filled(0).astype(dtype)
+                        if not np.any(data):
+                            continue  # skip empty blocks
+
+                        existing = dst.read(1, window=dst_window, masked=False).astype(dtype)
+                        combined = np.maximum(existing, data)
+                        dst.write(combined, 1, window=dst_window)
+
+def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, bounds):
+    """
+    Build one global raster per tag by mosaicking all tile rasters of that tag.
+
+    - Global grid is defined by the (snapped) input bounds + resolution.
+    - For each tag, we find all per-tile TIFFs matching that tag and mosaic them.
+    """
+
+    raster_dir = Path(raster_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    # Global grid = snapped user bounds (option A you chose)
+    xmin, ymin, xmax, ymax = snap_bounds(bounds, res_deg)
+    global_width = int(round((xmax - xmin) / res_deg))
+    global_height = int(round((ymax - ymin) / res_deg))
+
+    # Note: from_origin(xmin, ymax, x_res, y_res)
+    global_transform = rasterio.transform.from_origin(xmin, ymax, res_deg, res_deg)
+
+    # Discover tags from the first tile dir
+    first_tile = next(raster_dir.glob("tile_*"))
+    tags = sorted({
+        strip_shard_suffix(tif.stem)
+        for tif in first_tile.glob("*_[0-9][0-9][0-9].tif")
+    })
+
+    global_tag_paths = []
+
+    for tag in tags:
+        print(f"[MERGE-TAG] {tag}")
+
+        # find all shards across all tiles (only inside tile_* directories)
+        tile_tifs = []
+        for tile_dir in sorted(raster_dir.glob("tile_*")):
+            tile_tifs.extend(sorted(tile_dir.glob(f"{tag}_*.tif")))
+
+        if not tile_tifs:
+            print(f"[SKIP] No shards for tag {tag}")
+            continue
+
+        out_tif = out_dir / f"{tag}_global_{year}_{res_m}m.tif"
+        if out_tif.exists():
+            print(f"[SKIP] Already exists: {out_tif.name}")
+            global_tag_paths.append(out_tif)
+            continue
+
+        mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_transform)
+        global_tag_paths.append(out_tif)
+
+    return global_tag_paths
+
+def merge_rasters_sum(input_tifs, out_tif, profile_override=None):
+    """
+    Extremely fast global merge: sum 100+ rasters blockwise using numpy.memmap.
+
+    - input_tifs: list of TIFF paths (all on the same grid)
+    - out_tif: output GeoTIFF path
+    - profile_override: optional rasterio profile overrides
+    - Uses 1024x1024 read chunks for high IO efficiency.
+    """
+
+    if not input_tifs:
+        raise ValueError("No rasters provided for merge.")
+
+    with rasterio.open(input_tifs[0]) as src0:
+        profile = src0.profile.copy()
+        height, width = src0.height, src0.width
+        transform = src0.transform
+        crs = src0.crs
+
+    profile.update(
+        dtype="uint8",
+        nodata=None,
+        compress="DEFLATE",
+        bigtiff="YES",
+        tiled=True
+    )
+
+    if profile_override:
+        profile.update(profile_override)
+
+    tmp_path = str(out_tif) + ".tmp"
+    mm = np.memmap(tmp_path, dtype=np.uint16, mode="w+", shape=(height, width))
+    mm[:] = 0  # initialize
+
+    CH = 1024
+    CW = 1024
+
+    for idx, tif in enumerate(input_tifs, 1):
+        print(f"[MERGE-INFRA] Adding {idx}/{len(input_tifs)}: {Path(tif).name}")
+
+        with rasterio.open(tif) as src:
+            if src.width != width or src.height != height:
+                raise ValueError(f"Raster size mismatch in {tif}")
+
+            for row in range(0, height, CH):
+                for col in range(0, width, CW):
+                    h = min(CH, height - row)
+                    w = min(CW, width - col)
+                    window = Window(col, row, w, h)
+
+                    arr = src.read(1, window=window, masked=True).filled(0).astype(np.uint16)
+
+                    mm[row:row+h, col:col+w] += arr
+
+    with rasterio.open(out_tif, "w", **profile) as dst:
+        dst.write(mm, 1)
+
+    # Cleanup
+    del mm
+    os.remove(tmp_path)
+
+    print(f"[MERGE-INFRA] Created: {out_tif}")
     return out_tif
 
-def _calc_sum(inputs: List[Path], out_path: Path):
-    """
-    Sum ≤26 (limit) rasters safely (A+B+...).
-    Unsets NoData on all inputs and output to avoid propagation.
-    """
 
-    if len(inputs) == 0:
-        raise ValueError("No rasters provided to _calc_sum")
-    if len(inputs) > 26:
-        raise ValueError("Too many inputs for a single gdal_calc call (max=26)")
-
-    calc_expr = " + ".join([f"nan_to_num({chr(65+i)})" for i in range(len(inputs))])
-
-    if out_path.exists():
-        out_path.unlink()
-
-    args = [
-        "gdal_calc.py", "--quiet", "--overwrite",
-        f"--outfile={str(out_path)}",
-        "--type=Byte",
-        "--calc", calc_expr,
-        "--co=COMPRESS=NONE",
-        "--co=BIGTIFF=YES",
-    ]
-
-    for i, r in enumerate(inputs):
-        args.extend([f"-{chr(65+i)}", str(r)])
-
-    # safer execution
-    try:
-        subprocess.run(args, check=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"gdal_calc failed for chunk: {out_path}\nInputs: {inputs}") from e
-
-    # Only unset nodata on final output
-    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=False)
-
-
-
-def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 8):
-    """
-    Handles cases with more than 26 rasters by merging them in parallel chunks.
-    Runs several _calc_sum() calls concurrently and merges intermediate results
-    until one final raster remains.
-    """
-
-    if len(inputs) == 0:
-        raise ValueError("No rasters provided to _calc_sum_safe")
-
-    if len(inputs) == 1:
-        shutil.copy(inputs[0], out_path)
-        subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=False)
-        return
-
-    tmp_dir = out_path.parent / "_tmp_merge_chunks"
-    tmp_dir.mkdir(exist_ok=True)
-
-    current = inputs
-    round_idx = 0
-
-    while len(current) > 1:
-        round_idx += 1
-        next_round = []
-
-        chunks = [current[i:i + chunk_size] for i in range(0, len(current), chunk_size)]
-        print(f"[MERGE] Round {round_idx}: {len(current)} inputs → {len(chunks)} chunks")
-
-        for ci, chunk in enumerate(chunks):
-            out_chunk = tmp_dir / f"sum_{round_idx:02d}_{ci:03d}.tif"
-
-            # Run chunk merge
-            try:
-                _calc_sum(chunk, out_chunk)
-            except Exception as e:
-                print(f"[WARN] Chunk merge failed (round {round_idx}, chunk {ci}). Retrying single-thread...")
-                # retry once, no parallelism inside calc_sum
-                try:
-                    _calc_sum(chunk, out_chunk)
-                except Exception:
-                    raise RuntimeError(f"FAILED MERGING CHUNK (round {round_idx}, chunk {ci})") from e
-
-            # Validate TIFF (very important!)
-            ds = gdal.Open(str(out_chunk))
-            if ds is None:
-                out_chunk.unlink(missing_ok=True)
-                raise RuntimeError(
-                    f"Corrupt temporary raster produced at {out_chunk}. "
-                    f"Chunk {ci}, round {round_idx}. Reduce chunk_size further."
-                )
-            ds = None
-
-            next_round.append(out_chunk)
-
-        # Cleanup: remove files from previous round
-        if round_idx > 1:
-            for p in current:
-                if p.parent == tmp_dir and p.exists():
-                    p.unlink(missing_ok=True)
-
-        current = next_round
-
-    # Final move
-    shutil.move(str(current[0]), str(out_path))
-    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=False)
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    print(f"[MERGE] Final merged raster: {out_path}")
-
-
-def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir, year=None, res_m=None):
-    """
-    Merge all tile rasters for a tag into a global GeoTIFF using VRT + gdal_translate.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    input_tifs = sorted(Path(tiles_dir).rglob(f"*/{tag}.tif"))
-    if not input_tifs:
-        print(f"[SKIP] No rasters found for tag {tag}")
-        return tag, None
-    
-    # Build output names
-    suffix = ""
-    if year is not None:
-        suffix += f"_{year}"
-    if res_m is not None:
-        suffix += f"_{res_m}m"
-
-    vrt_path = output_dir / f"{tag}{suffix}.vrt"
-    out_tif = output_dir / f"{tag}_global{suffix}.tif"
-
-    # Resume-safe: skip if already done
-    if out_tif.exists():
-        print(f"[SKIP] Already merged {tag}")
-        return tag, out_tif
-
-    # Clean up any old vrt before rebuilding
-    if vrt_path.exists():
-        vrt_path.unlink()
-
-    buildvrt_cmd = ["gdalbuildvrt", str(vrt_path)] + [str(f) for f in input_tifs]
-    translate_cmd = [
-        "gdal_translate", str(vrt_path), str(out_tif),
-        "-co", "COMPRESS=NONE",
-        "-co", "BIGTIFF=YES",
-        "-co", "TILED=YES",
-        "-a_nodata", "none"
-    ]
-
-    try:
-        subprocess.run(buildvrt_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(translate_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"[MERGE OK] {tag} → {out_tif}")
-        return tag, out_tif
-    except subprocess.CalledProcessError as e:
-        print(f"[MERGE FAIL] {tag}: {e}")
-        return tag, None
-
-def merge_all_tags_parallel(tags, tiles_dir, output_dir, year=None, res_m=None, max_workers=None):
-    """Run VRT-based merges for all tags in parallel."""
-    if max_workers is None:
-        max_workers = min(12, multiprocessing.cpu_count())
-
-    tiles_dir = Path(tiles_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[MERGE] Starting parallel global merges for {len(tags)} tags using {max_workers} workers...")
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(merge_tag_across_tiles_vrt, tag, tiles_dir, output_dir, year, res_m): tag for tag in tags}
-
-        for i, f in enumerate(as_completed(futures), 1):
-            tag = futures[f]
-            try:
-                _, result = f.result()
-                if result:
-                    print(f"[{i}/{len(tags)}] Done: {tag}")
-            except Exception as e:
-                print(f"[ERROR] {tag}: {e}")
-
-    print(f"[MERGE] All tag merges complete. Outputs in {output_dir}")
+def build_global_infrastructure(global_tag_rasters, out_path):
+    print(f"[MERGE-INFRA] Summing {len(global_tag_rasters)} global tag rasters")
+    merge_rasters_sum(global_tag_rasters, out_path)
+    return out_path
 
 
 def upload_to_gcs(local_path: Path, gcs_uri: str):
@@ -932,7 +982,8 @@ def main():
     upload_merged_only = args.upload_merged_only
     res_m = degrees_to_meters(res)
     tile_size = args.tile
-    
+    snapped_bounds = snap_bounds(bounds, res)
+
     # Define paths and names.
     year_dir = OUTPUT_BASE_DIR / f"{year}"
     txt_dir = year_dir
@@ -978,24 +1029,19 @@ def main():
 
     with log_time("[4] Rasterize CSVs by tile (single-band rasters per tag)"):
 
+        tiles = generate_snapped_tiles(snapped_bounds, tile_size)
+
         csv_files = list(csv_dir.glob("*.csv"))
         if not csv_files:
             print("[WARN] No CSV files to rasterize.")
         else:
-            tiles = generate_global_tiles(bounds, step=tile_size)
-            print(f"[RASTERIZE] Splitting world into {len(tiles)} tiles of {tile_size}°×{tile_size}°")
+            print(f"[RASTERIZE] Splitting AOI into {len(tiles)} tiles of {tile_size}°×{tile_size}°")
 
             tile_outputs = []
             for i, tile_bounds in enumerate(tiles, 1):
+                tiles = generate_snapped_tiles(snapped_bounds, tile_size)
                 tile_dir = raster_dir / f"tile_{i:03d}"
                 tile_dir.mkdir(parents=True, exist_ok=True)
-                tile_out = tile_dir / f"infra_tile_{i:03d}.tif"
-
-                # --- Skip if tile already exists ---
-                if tile_out.exists():
-                    print(f"[SKIP] Tile {i}/{len(tiles)} already rasterized ({tile_out.name}) — skipping.")
-                    tile_outputs.append(tile_out)
-                    continue
 
                 print(f"[TILE {i}/{len(tiles)}] Processing bounds {tile_bounds}")
 
@@ -1003,7 +1049,7 @@ def main():
                     # Group CSV shards by tag (strip shard suffix)
                     tag_groups = defaultdict(list)
                     for csv_path in csv_files:
-                        tag_base = re.sub(r"(_[0-9]{3})+$", "", csv_path.stem)
+                        tag_base = strip_shard_suffix(csv_path.stem)
                         tag_groups[tag_base].append(csv_path)
 
                     # Parallel rasterization (each tag → single-band raster)
@@ -1023,16 +1069,6 @@ def main():
                             if j % 10 == 0 or j == len(futures):
                                 print(f"[TILE {i}] {j}/{len(futures)} tags rasterized.")
 
-                    # --- Merge all tag rasters for this tile into a summed infrastructure layer ---
-                    tag_tifs = list(tile_dir.glob("*.tif"))
-                    if not tag_tifs:
-                        print(f"[TILE {i}] No rasters produced — skipping.")
-                        continue
-
-                    _calc_sum_safe(tag_tifs, tile_out)
-                    tile_outputs.append(tile_out)
-                    print(f"[TILE {i}] Completed and saved {tile_out.name}")
-
                 except Exception as e:
                     print(f"[TILE {i}] Failed: {e}")
                     continue
@@ -1040,51 +1076,23 @@ def main():
             print(f"[RASTERIZE] Completed {len(tile_outputs)}/{len(tiles)} tiles.")
 
     # Merge per-tile infrastructure rasters into global infra layer
-    with log_time("[5a] Merge tile infrastructure rasters into global layer"):
-        if merged_path.exists():
-            print(f"[SKIP] Global infrastructure raster already exists: {merged_path.name}")
-        else:
-            tile_outputs = sorted(raster_dir.glob("tile_*/infra_tile_*.tif"))
-            if not tile_outputs:
-                print("[WARN] No tile rasters found for merging.")
-            else:
-                print(f"[MERGE] Combining {len(tile_outputs)} tile rasters → {merged_path.name}")
-                subprocess.run([
-                    "gdal_merge.py", "-o", str(merged_path),
-                    "-of", "GTiff",
-                    "-co", "TILED=YES",
-                    "-co", "BLOCKXSIZE=1024",
-                    "-co", "BLOCKYSIZE=1024",
-                    "-co", "COMPRESS=NONE",
-                    "-co", "BIGTIFF=YES"
-                ] + [str(t) for t in tile_outputs], check=True)
-                print(f"[MERGE] Global raster created: {merged_path}")
+    with log_time("[5] Global tag rasters merge"):
+        global_tag_rasters = build_global_tag_rasters(
+            raster_dir, raster_dir, year, res, res_m, snapped_bounds
+        )
 
-    # Merge per-tag rasters across tiles into global rasters
-    with log_time("[5b] Merge per-tag rasters across tiles"):
-        # Get all tag names from the first tile folder
-        first_tile = next(raster_dir.glob("tile_*"))
-        tags = []
-        for p in first_tile.glob("*.tif"):
-            if p.name.startswith("infra_"):
-                continue
-            # drop shard suffix: _001, _002, etc
-            base = re.sub(r"_[0-9]{3}$", "", p.stem)
-            if base not in tags:
-                tags.append(base)
-        tags = sorted(tags)
-        print(f"[MERGE] Found {len(tags)} tags to merge across tiles.")
+    infra_path = year_dir / f"flii_infra_{year}_{res_m}m.tif"
 
-        res_m = degrees_to_meters(res)
-        merge_all_tags_parallel(tags, raster_dir, raster_dir, year=year, res_m=res_m)
+    with log_time("[6] Global infrastructure merge"):
+        build_global_infrastructure(global_tag_rasters, infra_path)
 
-    with log_time("[6] Initialize Earth Engine + export rasters"):
+    with log_time("[7] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
         export_rasters_to_gee(raster_dir, year, res, upload_merged_only)
 
     # Optionally clean up intermediates.
     if do_cleanup:
-        with log_time("[7] Cleanup intermediates"):
+        with log_time("[8] Cleanup intermediates"):
             cleanup_intermediates(year_dir)
 
 if __name__ == "__main__":

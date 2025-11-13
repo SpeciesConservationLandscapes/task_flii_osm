@@ -26,7 +26,8 @@ RUN pip install \
     google-cloud-storage==3.4.1 \
     google-api-python-client==2.184.0 \
     packaging==25.0  \
-    importlib-metadata>=6.6  # harmless on 3.11, but fine to keep
+    importlib-metadata>=6.6 \
+    rasterio==1.4.0
 
 WORKDIR /app
 COPY src ./src
