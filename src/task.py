@@ -487,28 +487,52 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
     return tiles
 
 def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
+    """
+    Rasterize CSV shards for each tag.
+    Each shard -> its own raster, then summed into final <tag>.tif.
+    """
+
     safe_tag = re.sub(r"[=:/@]", "_", tag)
     out_tif = tile_dir / f"{safe_tag}.tif"
     if out_tif.exists():
         return out_tif
-    subprocess.run([
-        "gdal_rasterize",
-        "-a", "BURN",
-        "-a_srs", "EPSG:4326",
-        "-ot", "Byte",
-        "-at",
-        "-te", *map(str, tile_bounds),
-        "-tr", str(res), str(res),
-        "-init", "0",
-        "-co", "TILED=YES",
-        "-co", "BIGTIFF=YES",
-        "-co", "COMPRESS=NONE",
-        f"CSV:{csv_group[0]}",
-        str(out_tif)
-    ], check=True)
+
+    shard_rasters = []
+
+    # Rasterize each CSV shard separately
+    for shard_csv in sorted(csv_group):
+        shard_name = Path(shard_csv).stem
+        shard_tif = tile_dir / f"{shard_name}.tif"
+
+        # Skip if the shard already rasterized
+        if not shard_tif.exists():
+            subprocess.run([
+                "gdal_rasterize",
+                "-a", "BURN",
+                "-a_srs", "EPSG:4326",
+                "-ot", "Byte",
+                "-te", *map(str, tile_bounds),
+                "-tr", str(res), str(res),
+                "-init", "0",
+                "-co", "TILED=YES",
+                "-co", "BIGTIFF=YES",
+                "-co", "COMPRESS=NONE",
+                f"CSV:{shard_csv}",
+                str(shard_tif)
+            ], check=True)
+
+        shard_rasters.append(shard_tif)
+
+    # If only one raster, no need to merge/sum
+    if len(shard_rasters) == 1:
+        shutil.copy(shard_rasters[0], out_tif)
+        subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_tif)], check=True)
+        return out_tif
+
+    # Sum all shard tif's into final tag tif
+    _calc_sum_safe(shard_rasters, out_tif)
 
     return out_tif
-
 
 def _calc_sum(inputs: List[Path], out_path: Path):
     """
@@ -610,8 +634,7 @@ def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir, year=None, res_m=None
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Match both tag.tif and tag_###.tif (handles global and AOI cases)
-    input_tifs = sorted(Path(tiles_dir).rglob(f"*/{tag}*.tif"))
+    input_tifs = sorted(Path(tiles_dir).rglob(f"*/{tag}.tif"))
     if not input_tifs:
         print(f"[SKIP] No rasters found for tag {tag}")
         return tag, None
@@ -1025,9 +1048,15 @@ def main():
     with log_time("[5b] Merge per-tag rasters across tiles"):
         # Get all tag names from the first tile folder
         first_tile = next(raster_dir.glob("tile_*"))
-        tags = sorted(
-            [p.stem for p in first_tile.glob("*.tif") if not p.name.startswith("infra_")]
-        )
+        tags = []
+        for p in first_tile.glob("*.tif"):
+            if p.name.startswith("infra_"):
+                continue
+            # drop shard suffix: _001, _002, etc
+            base = re.sub(r"_[0-9]{3}$", "", p.stem)
+            if base not in tags:
+                tags.append(base)
+        tags = sorted(tags)
         print(f"[MERGE] Found {len(tags)} tags to merge across tiles.")
 
         res_m = degrees_to_meters(res)
