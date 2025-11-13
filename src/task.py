@@ -539,15 +539,11 @@ def _calc_sum(inputs: List[Path], out_path: Path):
     Sum ≤26 (limit) rasters safely (A+B+...).
     Unsets NoData on all inputs and output to avoid propagation.
     """
-    
+
     if len(inputs) == 0:
         raise ValueError("No rasters provided to _calc_sum")
     if len(inputs) > 26:
         raise ValueError("Too many inputs for a single gdal_calc call (max=26)")
-
-    # Unset NoData before summing
-    for r in inputs:
-        subprocess.run(["gdal_edit.py", "-unsetnodata", str(r)], check=True)
 
     calc_expr = " + ".join([f"nan_to_num({chr(65+i)})" for i in range(len(inputs))])
 
@@ -562,16 +558,22 @@ def _calc_sum(inputs: List[Path], out_path: Path):
         "--co=COMPRESS=NONE",
         "--co=BIGTIFF=YES",
     ]
+
     for i, r in enumerate(inputs):
         args.extend([f"-{chr(65+i)}", str(r)])
 
-    subprocess.run(args, check=True)
+    # safer execution
+    try:
+        subprocess.run(args, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"gdal_calc failed for chunk: {out_path}\nInputs: {inputs}") from e
 
-    # Remove any NoData flag on output to ensure valid numeric sum
-    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
+    # Only unset nodata on final output
+    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=False)
 
 
-def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
+
+def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 8):
     """
     Handles cases with more than 26 rasters by merging them in parallel chunks.
     Runs several _calc_sum() calls concurrently and merges intermediate results
@@ -581,51 +583,65 @@ def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
     if len(inputs) == 0:
         raise ValueError("No rasters provided to _calc_sum_safe")
 
-    # If only one input, just copy
     if len(inputs) == 1:
         shutil.copy(inputs[0], out_path)
-        subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
+        subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=False)
         return
 
     tmp_dir = out_path.parent / "_tmp_merge_chunks"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(exist_ok=True)
 
     current = inputs
     round_idx = 0
-    num_threads = max(1, min(os.cpu_count() or 2, 16))  # limit to avoid I/O thrash
 
     while len(current) > 1:
         round_idx += 1
-        next_round: List[Path] = []
+        next_round = []
+
         chunks = [current[i:i + chunk_size] for i in range(0, len(current), chunk_size)]
-        print(f"[MERGE] Round {round_idx}: {len(current)} rasters → {len(chunks)} chunks (parallel {num_threads})")
+        print(f"[MERGE] Round {round_idx}: {len(current)} inputs → {len(chunks)} chunks")
 
-        with ThreadPoolExecutor(max_workers=num_threads) as exe:
-            futures = {}
-            for ci, chunk in enumerate(chunks):
-                out = tmp_dir / f"sum_{round_idx:02d}_{ci:03d}.tif"
-                fut = exe.submit(_calc_sum, chunk, out)
-                futures[fut] = out
+        for ci, chunk in enumerate(chunks):
+            out_chunk = tmp_dir / f"sum_{round_idx:02d}_{ci:03d}.tif"
 
-            for fut in as_completed(futures):
-                fut.result()
-                next_round.append(futures[fut])
+            # Run chunk merge
+            try:
+                _calc_sum(chunk, out_chunk)
+            except Exception as e:
+                print(f"[WARN] Chunk merge failed (round {round_idx}, chunk {ci}). Retrying single-thread...")
+                # retry once, no parallelism inside calc_sum
+                try:
+                    _calc_sum(chunk, out_chunk)
+                except Exception:
+                    raise RuntimeError(f"FAILED MERGING CHUNK (round {round_idx}, chunk {ci})") from e
 
-        # Clean up older intermediates from previous round
+            # Validate TIFF (very important!)
+            ds = gdal.Open(str(out_chunk))
+            if ds is None:
+                out_chunk.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Corrupt temporary raster produced at {out_chunk}. "
+                    f"Chunk {ci}, round {round_idx}. Reduce chunk_size further."
+                )
+            ds = None
+
+            next_round.append(out_chunk)
+
+        # Cleanup: remove files from previous round
         if round_idx > 1:
             for p in current:
                 if p.parent == tmp_dir and p.exists():
-                    try:
-                        p.unlink()
-                    except:
-                        pass
+                    p.unlink(missing_ok=True)
 
         current = next_round
 
+    # Final move
     shutil.move(str(current[0]), str(out_path))
-    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
+    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=False)
+
     shutil.rmtree(tmp_dir, ignore_errors=True)
     print(f"[MERGE] Final merged raster: {out_path}")
+
 
 def merge_tag_across_tiles_vrt(tag, tiles_dir, output_dir, year=None, res_m=None):
     """
