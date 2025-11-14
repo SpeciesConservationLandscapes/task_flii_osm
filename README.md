@@ -5,7 +5,7 @@
 
 The **FLII OSM** task automates the processing of OpenStreetMap (OSM) data to generate infrastructure layers used in the *Forest Landscape Integrity Index (FLII)*.
 
-This script fetches, processes, rasterizes, and exports OSM features into GeoTIFFs, and publishes them as Google Earth Engine (EE) assets for use in FLII generation.
+This script fetches, processes, and exports OSM features into GeoTIFFs, and publishes them as Google Earth Engine (EE) assets for use in FLII generation.
 
 It is recommended to run the FLII OSM pipeline inside a Docker container to ensure a consistent and reproducible environment.
 
@@ -82,17 +82,18 @@ task_flii_osm/
 Run `python src/task.py --help` for a list of variables:
 
 ```
-usage: python src/task.py [-h] [--year YEAR] [--resolution RESOLUTION] [--bounds xmin ymin xmax ymax] [--max_csv_rows MAX_CSV_ROWS] [--cleanup] [--upload_merged_only]
+usage: python src/task.py [-h] [--year YEAR] [--resolution RESOLUTION] [--bounds xmin ymin xmax ymax]
+                          [--max_csv_rows MAX_CSV_ROWS] [--tile TILE] [--cleanup] [--upload_merged_only]
 
 Run the FLII OSM-based infrastructure pipeline.
 
 This pipeline downloads OpenStreetMap global data for the specified year, filters features based on configured tags and weights (in osm_config.json), converts them to CSV and rasters, merges them into an infrastructure layer, and uploads both individual layers and the final raster to Google Earth Engine.
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   --year YEAR           Target year for OSM data (e.g., 2024).
                         Default = current (today's) year.
-                        Uses previous year's planet snapshot (looks for a file from/closest to 12/31/year-1).
+                        Uses previous year's planet snapshot (looks for a file from/closest to 12/31/year-1).        
   --resolution RESOLUTION
                         Output raster resolution in degrees (default = 0.00269 ≈ 300m at the equator).
   --bounds xmin ymin xmax ymax
@@ -102,6 +103,7 @@ optional arguments:
                         Example: --bounds -10 -56 -35 5
   --max_csv_rows MAX_CSV_ROWS
                         Max rows per tag CSV shard (streaming split). Default: 1_000_000
+  --tile TILE           Tile size in degrees for global tiling (default = 60). Smaller values create more tiles.     
   --cleanup             Remove intermediate CSVs and raster files after successful processing.
   --upload_merged_only  If set, upload only the merged raster to GCS and GEE instead of all tag rasters.
 ```
@@ -126,10 +128,10 @@ python src/task.py --year 2024 --upload_merged_only
 
 If you want to change the raster resolution, change `--resolution` flag. E.g. 100 m (near the Equator). Always in EPSG:4326:
 ```
-python src/task.py --year 2024 --resolution 0.0009 --upload_merged_only
+python src/task.py --year 2024 --resolution 0.0009
 ```
 
-Note: For resolutions lower than 300 m (0.00269), you might need to change the `--tile` flag to avoid tiles with too many pixels (e.g, `--tile 30`).
+*Note*: For resolutions lower than 300 m (0.00269), you might need to change the `--tile` flag to avoid tiles with too many pixels (e.g, `--tile 30`).
 
 If you want to clean up intermediate files from the container/VM right away (e.g. CSV files, temporary merge rasters, etc), you can use the `--cleanup` flag.
 ```
