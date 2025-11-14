@@ -545,8 +545,8 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
                 "-a", "BURN",
                 "-a_srs", "EPSG:4326",
                 "-ot", "Byte",
-                "-te", str(xmin), str(ymin), str(xmax), str(ymax),
-                "-ts", str(px_w), str(px_h),
+                "-tr", str(res), str(res),
+                "-te", str(xmin), str(ymin), str(xmin + px_w * res), str(ymin + px_h * res),
                 "-init", "0",
                 "-co", "TILED=YES",
                 "-co", "BLOCKXSIZE=256",
@@ -802,11 +802,25 @@ def ensure_ee_folder_exists(folder_path: str):
         print(f"[EE FOLDER] Creating: {folder_path}")
         ee.data.createAsset({'type': 'Folder'}, folder_path)
 
+def ensure_ee_image_collection(asset_id: str):
+    """
+    Ensure an Earth Engine ImageCollection for tag images exists.
+    If not, create it.
+    """
+    try:
+        ee.data.getAsset(asset_id)
+        print(f"[EE COLLECTION] Exists: {asset_id}")
+    except ee.ee_exception.EEException:
+        print(f"[EE COLLECTION] Creating: {asset_id}")
+        ee.data.createAsset({"type": "ImageCollection"}, asset_id)
+
 def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
     Uploads rasters to GCS and imports them as Earth Engine assets.
     - If upload_merged_only=True: uploads only the final infrastructure raster.
     - Otherwise: uploads all per-tag global rasters plus the infrastructure raster.
+    - Tag rasters: ImageCollection 'tags_{year}_{res_m}m'
+    - Infrastructure raster: in the root year folder
     """
 
     print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
@@ -814,14 +828,21 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
     res_m = degrees_to_meters(res)
     merged_infra = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
 
-    # --- Collect rasters to upload ---
+    # Target ImageCollection for tag rasters
+    collection_id = f"{EE_ASSET_ROOT}/{year}/tags_{year}_{res_m}m"
+
+    # Ensure collection & folder exists
+    ensure_ee_folder_exists(f"{EE_ASSET_ROOT}/{year}")
+    parent = f"{EE_ASSET_ROOT}/{year}"
+    ensure_ee_folder_exists(parent)
+    ensure_ee_image_collection(collection_id)
+
     tag_rasters = sorted(raster_dir.glob("*_global*.tif"))
     if not tag_rasters and not upload_merged_only:
         print("[WARN] No global tag rasters found — skipping tag uploads.")
 
     to_upload = []
     if merged_infra.exists():
-        print(f"[EXPORT] Found infrastructure raster: {merged_infra.name}")
         to_upload.append(merged_infra)
     else:
         print("[WARN] Infrastructure raster not found — skipping.")
@@ -835,18 +856,28 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
 
     print(f"[EXPORT] Total rasters to upload: {len(to_upload)}")
 
-    # --- Upload & import each raster ---
     exported_assets = []
+
     for tif in to_upload:
+
+        is_infra = tif == merged_infra
+
+        # Tag rasters go into ImageCollection, infra goes to parent folder
+        if is_infra:
+            safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
+            asset_id = f"{EE_ASSET_ROOT}/{year}/{safe_stem}"
+        else:
+            # Each tag raster becomes an individual element inside the ImageCollection
+            safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
+            asset_id = f"{collection_id}/{safe_stem}"
+
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
-        safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
-        asset_id = f"{EE_ASSET_ROOT}/{year}/{safe_stem}"
 
         try:
-            print(f"[UPLOAD] Uploading {tif.name} to {gcs_uri}")
+            print(f"[UPLOAD] Uploading {tif.name} → {gcs_uri}")
             upload_to_gcs(tif, gcs_uri)
 
-            # Determine number of bands (1 for per-tag and infra)
+            # Determine band structure
             try:
                 ds = gdal.Open(str(tif))
                 band_count = ds.RasterCount if ds else 1
@@ -855,18 +886,19 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
             except Exception:
                 bands = [{"id": "b1"}]
 
-            print(f"[EE IMPORT] Importing {tif.name} ({len(bands)} bands) → {asset_id}")
+            print(f"[EE IMPORT] Importing {tif.name} ({len(bands)} band(s)) → {asset_id}")
 
             ensure_ee_folder_exists("/".join(asset_id.split("/")[:-1]))
 
-            # Skip existing asset
+            # Skip if asset exists
             try:
                 ee.data.getAsset(asset_id)
-                print(f"[EE IMPORT] Asset already exists: {asset_id} — skipping.")
+                print(f"[EE IMPORT] Asset already exists — skipping: {asset_id}")
                 continue
             except ee.ee_exception.EEException:
                 pass
 
+            # Build ingestion request
             props = {"year": year, "resolution_m": res_m}
             params = {
                 "id": asset_id,
@@ -896,7 +928,6 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
                 "status": f"failed - {e}",
             })
 
-    # --- Save metadata locally & to GCS ---
     metadata_path = raster_dir / f"gee_export_metadata_{year}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(exported_assets, f, indent=2)
@@ -908,15 +939,15 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
     except subprocess.CalledProcessError as e:
         print(f"[WARN] Could not upload metadata to GCS: {e}")
 
-    # --- Upload OSM metadata if available ---
     osm_meta_path = raster_dir.parent / "osm_download_metadata.json"
     if osm_meta_path.exists():
         osm_gcs_uri = f"gs://{GCS_BUCKET}/{year}/osm_download_metadata.json"
         try:
             subprocess.run(["gsutil", "cp", str(osm_meta_path), osm_gcs_uri], check=True)
-            print(f"[METADATA] Uploaded OSM metadata to GCS: {osm_gcs_uri}")
+            print(f"[METADATA] Uploaded OSM metadata: {osm_gcs_uri}")
         except subprocess.CalledProcessError as e:
             print(f"[WARN] Could not upload OSM metadata to GCS: {e}")
+
 
 def cleanup_intermediates(year_dir: Path):
     """
@@ -982,7 +1013,10 @@ def main():
     upload_merged_only = args.upload_merged_only
     res_m = degrees_to_meters(res)
     tile_size = args.tile
-    snapped_bounds = snap_bounds(bounds, res)
+    if bounds == (-180, -90, 180, 90):
+        snapped_bounds = bounds
+    else:
+        snapped_bounds = snap_bounds(bounds, res)
 
     # Define paths and names.
     year_dir = OUTPUT_BASE_DIR / f"{year}"
@@ -1039,7 +1073,7 @@ def main():
 
             tile_outputs = []
             for i, tile_bounds in enumerate(tiles, 1):
-                tiles = generate_snapped_tiles(snapped_bounds, tile_size)
+                pass
                 tile_dir = raster_dir / f"tile_{i:03d}"
                 tile_dir.mkdir(parents=True, exist_ok=True)
 
