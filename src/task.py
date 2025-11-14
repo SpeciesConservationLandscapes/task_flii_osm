@@ -21,20 +21,22 @@ import time
 from contextlib import contextmanager
 import math
 from tqdm import tqdm
-import itertools
 import multiprocessing
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+
 
 # ------------
 # GDAL CONFIG 
 # ------------
 
 gdal.UseExceptions()
-gdal.SetConfigOption("GDAL_CACHEMAX", "8192") # 8 GB global cache
-gdal.SetConfigOption("GDAL_SWATH_SIZE", "10485760") # 10 MB
+gdal.SetConfigOption("GDAL_CACHEMAX", "4096")  
+gdal.SetConfigOption("GDAL_SWATH_SIZE", "1048576")  
 gdal.SetConfigOption("GDAL_MAX_DATASET_POOL_SIZE", "400")
 os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
-os.environ["VSI_CACHE"] = "TRUE" 
-os.environ["VSI_CACHE_SIZE"] = "1000000000"  # 1 GB cache for virtual I/O
+os.environ["VSI_CACHE"] = "FALSE" 
 
 # ----------------------
 # DIRECTORY / OSM CONFIG
@@ -66,7 +68,6 @@ def log_time(label: str):
     It prints the elapsed time when the block ends.
     Used in the 'main' function.
     """
-    
     start = time.time()
     print(f"[TIMER] Starting: {label}")
     try:
@@ -80,7 +81,6 @@ def degrees_to_meters(res_deg: float) -> int:
     Approximate degrees to meters conversion at the equator.
     Used to append resolution suffixes like '_300m' to raster filenames.
     """
-
     meters = res_deg * 111_320
     return int(math.ceil(meters / 10.0) * 10)
 
@@ -88,7 +88,6 @@ def activate_gcloud_service_account():
     """
     Activates the gcloud service account using the provided key file or inlined JSON. 
     """
-
     print(f"[GCP AUTH] Activating service account for gcloud: {SERVICE_ACCOUNT}")
 
     # Find gcloud in PATH.
@@ -131,7 +130,6 @@ def init_google_earth_engine():
     Initializes the Earth Engine API.
     Sets cloud project.
     """
-
     activate_gcloud_service_account()
     print(f"[AUTH] Authenticating with service account: {SERVICE_ACCOUNT}")
 
@@ -160,7 +158,6 @@ def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]
     For example, if task_year=2024, it searches around 2023-12-31.
     It checks multiple known mirror URLs.
     """
-
     taskdate = datetime(task_year - 1, 12, 31)
 
     def _try_osm_urls(urlbase: str, maxage: int) -> Optional[Tuple[str, str]]:
@@ -218,7 +215,6 @@ def download_pbf(year: int, dest_path: Path) -> Path:
     Supports resuming partial downloads if the server allows it.
     Stores metadata (size, URL, date) about the download in a JSON file alongside the data.
     """
-
     metadata_path = dest_path.parent / "osm_download_metadata.json"
     url, found_date = _find_osm_pbf_url(year)
     print(f"[DOWNLOAD] Preparing to fetch {url}")
@@ -295,11 +291,8 @@ def download_pbf(year: int, dest_path: Path) -> Path:
 
 def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
     """
-    Convert an OSM PBF/BZ2 file directly to text using osmium export.
-    Optimized for global runs: filters by relevant keys only, no intermediate PBF.
-    Compatible with Osmium versions that expect JSON configs.
+    Converts an OSM PBF/BZ2 file to text using osmium export.
     """
-    
     if not osm_path.exists():
         raise FileNotFoundError(f"[ERROR] OSM input file not found: {osm_path}")
 
@@ -329,15 +322,15 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
         str(osm_path)
     ]
 
-    # Use stdbuf for unbuffered output if available
+    # Use stdbuf for unbuffered output if available.
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
 
-    # Force progress even in non-TTY Docker environments
+    # Force progress even in non-TTY Docker environments.
     env = os.environ.copy()
     env["OSMIUM_SHOW_PROGRESS"] = "1"
 
-    # Run and stream live progress (handles both \r and \n)
+    # Run and stream live progress.
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -378,56 +371,82 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     This allows flexible per-tag rasterization later.
     Shards are named like highway_residential_001.csv, highway_residential_002.csv, etc.
     """
-    
     os.makedirs(csv_dir, exist_ok=True)
-    target_tags = set(config.keys())  # e.g., {"highway=primary": 9, ...}
+    txt_file = Path(txt_file)
+    csv_dir = Path(csv_dir)
+
+    # Build config lookup for fast membership check
+    config_index = defaultdict(set)
+    for kv in config.keys():
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        config_index[k].add(v)
+
     tag_files: Dict[str, csv.writer] = {}
     tag_fhandles: Dict[str, any] = {}
     tag_shard_counts: Dict[str, int] = defaultdict(int)
     tag_row_counts: Dict[str, int] = defaultdict(int)
-
     out_paths: List[Path] = []
+
+    geom_prefixes = (
+        "POINT(", "MULTIPOINT(", "LINESTRING(", "MULTILINESTRING(",
+        "POLYGON(", "MULTIPOLYGON(", "GEOMETRYCOLLECTION("
+    )
+
+    # Super-tolerant regex for key=value pairs
+    tag_pattern = re.compile(
+        r'@?"?([\w:\-]+)"?\s*=\s*"?([\w\.\-:/%]+)"?',
+        flags=re.UNICODE
+    )
 
     with open(txt_file, "r", encoding="utf-8") as f:
         for line in f:
-            if not line.startswith("POINT(") and not line.startswith("LINESTRING(") and not line.startswith("POLYGON("):
+            if not line.startswith(geom_prefixes):
                 continue
 
-            geom_match = re.match(r'^(POINT|LINESTRING|POLYGON)\((.+)\)', line)
-            if not geom_match:
+            try:
+                wkt_end = line.index(")") + 1
+            except ValueError:
                 continue
-            wkt_end = line.index(")") + 1
+
             wkt = line[:wkt_end]
+            tags_str = line[wkt_end:].strip()
 
-            # Tags after geometry
-            tags_str = line[wkt_end:]
-            tags = dict(re.findall(r'@?([\w\:\-]+)=([\w\-\.\%\:/]+)', tags_str))
+            # Extract all key=value pairs (robust regex)
+            tags = {}
+            for k, v in tag_pattern.findall(tags_str):
+                tags[k.strip("@")] = v
 
-            for tag_val in target_tags:
-                if "=" not in tag_val:
+            # If nothing found, skip
+            if not tags:
+                continue
+
+            # Process valid matches
+            for tag, val in tags.items():
+                if tag not in config_index or val not in config_index[tag]:
                     continue
-                tag, val = tag_val.split("=", 1)
-                if tags.get(tag) == val:
-                    # open/rollover shard if needed
-                    if (tag_val not in tag_files) or (tag_row_counts[tag_val] >= max_rows):
-                        if tag_val in tag_fhandles:
-                            tag_fhandles[tag_val].close()
-                        safe = tag_val.replace(":", "_").replace("/", "_").replace("=", "_")
-                        shard_idx = tag_shard_counts[tag_val] + 1
-                        out_path = Path(csv_dir) / f"{safe}_{shard_idx:03d}.csv"
-                        fh = open(out_path, "w", newline="", encoding="utf-8")
-                        writer = csv.writer(fh)
-                        writer.writerow(["WKT", "BURN"])
-                        tag_files[tag_val] = writer
-                        tag_fhandles[tag_val] = fh
-                        tag_shard_counts[tag_val] = shard_idx
-                        tag_row_counts[tag_val] = 0
-                        out_paths.append(out_path)
+                tag_val = f"{tag}={val}"
+                burn = config[tag_val]
 
-                    # Bake the weight here.
-                    burn = int(config[tag_val])
-                    tag_files[tag_val].writerow([wkt, burn])
-                    tag_row_counts[tag_val] += 1
+                # Rotate shard if full
+                if (tag_val not in tag_files) or (tag_row_counts[tag_val] >= max_rows):
+                    if tag_val in tag_fhandles:
+                        tag_fhandles[tag_val].close()
+                    safe = re.sub(r"[=:/@]", "_", tag_val)
+                    shard_idx = tag_shard_counts[tag_val] + 1
+                    out_path = csv_dir / f"{safe}_{shard_idx:03d}.csv"
+                    fh = open(out_path, "w", newline="", encoding="utf-8")
+                    writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
+                    writer.writerow(["WKT", "BURN"])
+                    tag_files[tag_val] = writer
+                    tag_fhandles[tag_val] = fh
+                    tag_shard_counts[tag_val] = shard_idx
+                    tag_row_counts[tag_val] = 0
+                    out_paths.append(out_path)
+
+                tag_files[tag_val].writerow([wkt, burn])
+                tag_row_counts[tag_val] += 1
 
     for fh in tag_fhandles.values():
         try:
@@ -435,227 +454,303 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
         except:
             pass
 
-    print(f"[SPLIT] {txt_file} → {len(out_paths)} CSV shards")
+    print(f"[SPLIT] {txt_file.name} → {len(out_paths)} CSV shards written to {csv_dir}")
     return out_paths
 
-def _rasterize_single(in_csv: Union[str, Path], out_tif: Union[str, Path],
-                      bounds: Tuple[float,float,float,float], res: float):
+def strip_shard_suffix(name):
+    return re.sub(r"(_[0-9]{3})+$", "", name)
+
+def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
     """
-    Rasterize a 2-column CSV (WKT,BURN) to a tiled, compressed Byte GeoTIFF.
+    Generate a list of (xmin, ymin, xmax, ymax) tiles covering the extent.
+    The 'step' defines the tile size in degrees.
+    Each tile will be aligned on whole degree boundaries for consistency.
     """
+    xmin, ymin, xmax, ymax = bounds
+    tiles = []
+    x = xmin
+    while x < xmax:
+        y = ymin
+        while y < ymax:
+            tiles.append((
+                x,
+                y,
+                min(x + step, xmax),
+                min(y + step, ymax)
+            ))
+            y += step
+        x += step
+    return tiles
 
-    res_m = degrees_to_meters(res)
-    out_tif = Path(out_tif)
-    out_tif = out_tif.with_name(f"{out_tif.stem}_{res_m}m.tif")
+def snap_bounds(bounds, res):
+    xmin, ymin, xmax, ymax = bounds
+    xmin = math.floor(xmin / res) * res
+    ymin = math.floor(ymin / res) * res
+    xmax = math.ceil(xmax / res) * res
+    ymax = math.ceil(ymax / res) * res
+    return xmin, ymin, xmax, ymax
 
-    opts = gdal.RasterizeOptions(
-        format="GTiff",
-        outputType=gdalconst.GDT_Byte,
-        initValues=0,
-        burnValues=None, # read from attribute
-        attribute="BURN",
-        xRes=res,
-        yRes=res,
-        targetAlignedPixels=True,
-        outputSRS="EPSG:4326",
-        outputBounds=bounds,
-        creationOptions=[
-            "TILED=YES",
-            "BLOCKXSIZE=1024",
-            "BLOCKYSIZE=1024",
-            "COMPRESS=LZW",
-        ],
-    )
-    # Ensure directory
-    Path(out_tif).parent.mkdir(parents=True, exist_ok=True)
-    # Rasterize
-    gdal.Rasterize(str(out_tif), str(in_csv), options=opts)
-    return Path(out_tif)
+def generate_snapped_tiles(bounds, tile_deg):
+    xmin, ymin, xmax, ymax = bounds
+    tiles = []
+    x = xmin
+    while x < xmax:
+        y = ymin
+        while y < ymax:
+            tiles.append((x, y, x + tile_deg, y + tile_deg))
+            y += tile_deg
+        x += tile_deg
+    return tiles
 
-def rasterize_all(csvs: List[Path], out_dir: Path, bounds: Tuple[float,float,float,float], res: float) -> List[Path]:
+def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
     """
-    Run _rasterize_single in parallel for all CSVs using ProcessPoolExecutor.
-    Produce one GeoTIFF per CSV shard in out_dir.
-    """
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_tifs = [out_dir / (Path(c).stem + ".tif") for c in csvs]
-    num_cpus = multiprocessing.cpu_count() - 1 or 1
-    print(f"[RASTERIZE] {len(csvs)} CSVs with {num_cpus} workers...")
-
-    with ProcessPoolExecutor(max_workers=num_cpus) as exe:
-        futures = [exe.submit(_rasterize_single, c, o, bounds, res)
-                   for c, o in zip(csvs, out_tifs)]
-        for i, f in enumerate(as_completed(futures), 1):
-            try:
-                f.result()
-                print(f"[RASTERIZE] Completed {i}/{len(csvs)}")
-            except Exception as e:
-                print(f"[RASTERIZE] Failed on {i}/{len(csvs)}: {e}")
-
-    return out_tifs
-
-def merge_tag_shards(raster_dir: Path) -> List[Path]:
-    """
-    Merge all tag-level shard rasters (e.g., highway_residential_001, _002)
-    into a single raster per tag using gdal_calc.
-    Returns a list of merged tag rasters.
-    """
-
-    rasters = sorted(raster_dir.glob("*.tif"))
-    if not rasters:
-        print("[TAG MERGE] No rasters found to merge by tag.")
-        return []
-
-    tag_groups: Dict[str, List[Path]] = defaultdict(list)
-    for r in rasters:
-        base = re.sub(r"_[0-9]{3}$", "", r.stem)  # strip trailing _001 etc.
-        tag_groups[base].append(r)
-
-    merged_paths: List[Path] = []
-    for base, group in tag_groups.items():
-        if len(group) == 1:
-            merged_paths.append(group[0])
-            continue
-        print(f"[TAG MERGE] Merging {len(group)} shards for tag: {base}")
-        out_path = raster_dir / f"{base}.tif"
-        _calc_sum(group, out_path)
-        merged_paths.append(out_path)
-        # optional cleanup
-        for g in group:
-            if g != out_path:
-                try:
-                    g.unlink()
-                except:
-                    pass
-    print(f"[TAG MERGE] Produced {len(merged_paths)} tag-level rasters.")
-    return merged_paths
-
-def _calc_sum(inputs: List[Path], out_path: Path):
-    """
-    Sum ≤26 (limit) rasters safely (A+B+...).
-    Unsets NoData on all inputs and output to avoid propagation.
+    Rasterizes all CSV shards into individual TIFFs
+    inside each tile directory.
     """
     
-    if len(inputs) == 0:
-        raise ValueError("No rasters provided to _calc_sum")
-    if len(inputs) > 26:
-        raise ValueError("Too many inputs for a single gdal_calc call (max=26)")
+    tile_dir = Path(tile_dir)
+    tile_dir.mkdir(parents=True, exist_ok=True)
 
-    # Unset NoData before summing
-    for r in inputs:
-        subprocess.run(["gdal_edit.py", "-unsetnodata", str(r)], check=True)
+    xmin, ymin, xmax, ymax = tile_bounds
 
-    calc_expr = " + ".join([f"nan_to_num({chr(65+i)})" for i in range(len(inputs))])
+    # Compute exact number of pixels 
+    px_w = int(round((xmax - xmin) / res))
+    px_h = int(round((ymax - ymin) / res))
 
-    if out_path.exists():
-        out_path.unlink()
+    if px_w <= 0 or px_h <= 0:
+        raise ValueError(f"Invalid tile dims for {tag}: {px_w}×{px_h} from {tile_bounds}")
 
-    # Create an empty BigTIFF container explicitly so the driver uses 64-bit offsets
-    src_ds = gdal.Open(str(inputs[0]))
-    driver = gdal.GetDriverByName("GTiff")
-    tmp_ds = driver.CreateCopy(
-        str(out_path), src_ds, 0,
-        options=[
-            "TILED=YES",
-            "BLOCKXSIZE=1024",
-            "BLOCKYSIZE=1024",
-            "COMPRESS=LZW",
-            "BIGTIFF=YES",
-        ]
+    shard_rasters = []
+
+    # Rasterize each shard independently
+    for shard_csv in sorted(csv_group):
+        shard_name = Path(shard_csv).stem     # e.g., highway_residential_002
+        shard_tif = tile_dir / f"{shard_name}.tif"
+
+        if not shard_tif.exists():
+            cmd = [
+                "gdal_rasterize",
+                "-q", 
+                "-a", "BURN",
+                "-a_srs", "EPSG:4326",
+                "-ot", "Byte",
+                "-tr", str(res), str(res),
+                "-te", str(xmin), str(ymin), str(xmin + px_w * res), str(ymin + px_h * res),
+                "-init", "0",
+                "-co", "TILED=YES",
+                "-co", "BLOCKXSIZE=256",
+                "-co", "BLOCKYSIZE=256",
+                "-co", "BIGTIFF=YES",
+                "-co", "COMPRESS=DEFLATE",
+                f"CSV:{shard_csv}",
+                str(shard_tif)
+            ]
+
+            subprocess.run(cmd, check=True)
+
+        shard_rasters.append(shard_tif)
+
+    return shard_rasters
+
+def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_transform):
+    """
+    Mosaics many tile rasters of the same tag into a single global raster.
+    """
+    if not tile_tifs:
+        raise ValueError("No rasters provided for mosaic.")
+
+    # Use the first tile as a template for profile / CRS / datatype
+    with rasterio.open(tile_tifs[0]) as src0:
+        profile = src0.profile.copy()
+        crs = src0.crs
+        dtype = "uint8" 
+
+    profile.update(
+        width=global_width,
+        height=global_height,
+        transform=global_transform,
+        dtype=dtype,
+        nodata=None,
+        compress="DEFLATE",
+        bigtiff="YES",
+        tiled=True,
     )
-    tmp_ds = None 
 
-    args = [
-        "gdal_calc.py", "--quiet", "--overwrite",
-        f"--outfile={str(out_path)}",
-        "--type=Byte",
-        "--calc", calc_expr,
-        "--co=COMPRESS=LZW",
-        "--co=BIGTIFF=YES",
-    ]
-    for i, r in enumerate(inputs):
-        args.extend([f"-{chr(65+i)}", str(r)])
+    # 1) Create the (empty) tif
+    with rasterio.open(out_tif, "w", **profile):
+        pass  # just create; data will default to 0
 
-    subprocess.run(args, check=True)
+    # 2) Reopen in read/write mode and stream tiles in
+    with rasterio.open(out_tif, "r+") as dst:
+        for tif in tile_tifs:
+            with rasterio.open(tif) as src:
+                if src.crs != crs:
+                    raise ValueError(f"CRS mismatch for {tif}: {src.crs} vs {crs}")
 
-    # Remove any NoData flag on output to ensure valid numeric sum
-    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
+                left, bottom, right, top = src.bounds
+                tile_h, tile_w = src.height, src.width
 
+                # Upper-left pixel in the grid
+                row_ul, col_ul = rasterio.transform.rowcol(global_transform, left, top)
 
-def _calc_sum_safe(inputs: List[Path], out_path: Path, chunk_size: int = 20):
+                # Choose block size (use source blocks if available)
+                if src.block_shapes and len(src.block_shapes) > 0:
+                    block_h, block_w = src.block_shapes[0]
+                else:
+                    block_h, block_w = 256, 256
+
+                for r_off in range(0, tile_h, block_h):
+                    for c_off in range(0, tile_w, block_w):
+                        h = min(block_h, tile_h - r_off)
+                        w = min(block_w, tile_w - c_off)
+
+                        # Corresponding position in grid
+                        global_row = row_ul + r_off
+                        global_col = col_ul + c_off
+
+                        # Clip to bounds (important when tiles extend beyond AOI)
+                        if global_row >= global_height or global_col >= global_width:
+                            continue
+
+                        h_clip = min(h, global_height - global_row)
+                        w_clip = min(w, global_width - global_col)
+                        if h_clip <= 0 or w_clip <= 0:
+                            continue
+
+                        src_window = Window(c_off, r_off, w_clip, h_clip)
+                        dst_window = Window(global_col, global_row, w_clip, h_clip)
+
+                        data = src.read(1, window=src_window, masked=True).filled(0).astype(dtype)
+                        if not np.any(data):
+                            continue  # skip empty blocks
+
+                        existing = dst.read(1, window=dst_window, masked=False).astype(dtype)
+                        combined = np.maximum(existing, data)
+                        dst.write(combined, 1, window=dst_window)
+
+def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, bounds):
     """
-    Handles cases with more than 26 rasters by merging them in parallel chunks.
-    Runs several _calc_sum() calls concurrently and merges intermediate results
-    until one final raster remains.
+    Builds one global raster per tag by mosaicking all tile rasters of that tag.
+    - Global grid is defined by the (snapped) input bounds + resolution.
+    - For each tag, we find all per-tile TIFFs matching that tag and mosaic them.
+    """
+    raster_dir = Path(raster_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    # Global grid = snapped user bounds.
+    xmin, ymin, xmax, ymax = snap_bounds(bounds, res_deg)
+    global_width = int(round((xmax - xmin) / res_deg))
+    global_height = int(round((ymax - ymin) / res_deg))
+
+    # Note: from_origin(xmin, ymax, x_res, y_res).
+    global_transform = rasterio.transform.from_origin(xmin, ymax, res_deg, res_deg)
+
+    # Discover tags from the first tile dir.
+    first_tile = next(raster_dir.glob("tile_*"))
+    tags = sorted({
+        strip_shard_suffix(tif.stem)
+        for tif in first_tile.glob("*_[0-9][0-9][0-9].tif")
+    })
+
+    global_tag_paths = []
+
+    for tag in tags:
+        print(f"[MOSAIC-TAG] {tag}")
+
+        # find all shards across all tiles (only inside tile_* directories).
+        tile_tifs = []
+        for tile_dir in sorted(raster_dir.glob("tile_*")):
+            tile_tifs.extend(sorted(tile_dir.glob(f"{tag}_*.tif")))
+
+        if not tile_tifs:
+            print(f"[SKIP] No shards for tag {tag}")
+            continue
+
+        out_tif = out_dir / f"{tag}_global_{year}_{res_m}m.tif"
+        if out_tif.exists():
+            print(f"[SKIP] Already exists: {out_tif.name}")
+            global_tag_paths.append(out_tif)
+            continue
+
+        mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_transform)
+        global_tag_paths.append(out_tif)
+
+    return global_tag_paths
+
+def merge_rasters_sum(input_tifs, out_tif, profile_override=None):
+    """
+    Sums 100+ rasters blockwise using numpy.memmap.
+    - Uses 1024x1024 read chunks for high IO efficiency.
     """
 
-    if len(inputs) == 0:
-        raise ValueError("No rasters provided to _calc_sum_safe")
+    if not input_tifs:
+        raise ValueError("No rasters provided for merge.")
 
-    # If only one input, just copy
-    if len(inputs) == 1:
-        shutil.copy(inputs[0], out_path)
-        subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
-        return
+    with rasterio.open(input_tifs[0]) as src0:
+        profile = src0.profile.copy()
+        height, width = src0.height, src0.width
+        transform = src0.transform
+        crs = src0.crs
 
-    tmp_dir = out_path.parent / "_tmp_merge_chunks"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    profile.update(
+        dtype="uint8",
+        nodata=None,
+        compress="DEFLATE",
+        bigtiff="YES",
+        tiled=True
+    )
 
-    current = inputs
-    round_idx = 0
-    num_threads = max(1, min(os.cpu_count() or 2, 16))  # limit to avoid I/O thrash
+    if profile_override:
+        profile.update(profile_override)
 
-    while len(current) > 1:
-        round_idx += 1
-        next_round: List[Path] = []
-        chunks = [current[i:i + chunk_size] for i in range(0, len(current), chunk_size)]
-        print(f"[MERGE] Round {round_idx}: {len(current)} rasters → {len(chunks)} chunks (parallel {num_threads})")
+    tmp_path = str(out_tif) + ".tmp"
+    mm = np.memmap(tmp_path, dtype=np.uint16, mode="w+", shape=(height, width))
+    mm[:] = 0  # initialize
 
-        with ThreadPoolExecutor(max_workers=num_threads) as exe:
-            futures = {}
-            for ci, chunk in enumerate(chunks):
-                out = tmp_dir / f"sum_{round_idx:02d}_{ci:03d}.tif"
-                fut = exe.submit(_calc_sum, chunk, out)
-                futures[fut] = out
+    CH = 1024
+    CW = 1024
 
-            for fut in as_completed(futures):
-                fut.result()
-                next_round.append(futures[fut])
+    for idx, tif in enumerate(input_tifs, 1):
+        print(f"[MERGE-INFRA] Adding {idx}/{len(input_tifs)}: {Path(tif).name}")
 
-        # Clean up older intermediates from previous round
-        if round_idx > 1:
-            for p in current:
-                if p.parent == tmp_dir and p.exists():
-                    try:
-                        p.unlink()
-                    except:
-                        pass
+        with rasterio.open(tif) as src:
+            if src.width != width or src.height != height:
+                raise ValueError(f"Raster size mismatch in {tif}")
 
-        current = next_round
+            for row in range(0, height, CH):
+                for col in range(0, width, CW):
+                    h = min(CH, height - row)
+                    w = min(CW, width - col)
+                    window = Window(col, row, w, h)
 
-    shutil.move(str(current[0]), str(out_path))
-    subprocess.run(["gdal_edit.py", "-unsetnodata", str(out_path)], check=True)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    print(f"[MERGE] Final merged raster: {out_path}")
+                    arr = src.read(1, window=window, masked=True).filled(0).astype(np.uint16)
 
+                    mm[row:row+h, col:col+w] += arr
 
-def sum_all_rasters(inputs: List[Path], out_path: Path):
+    with rasterio.open(out_tif, "w", **profile) as dst:
+        dst.write(mm, 1)
+
+    # Cleanup
+    del mm
+    os.remove(tmp_path)
+
+    print(f"[MERGE-INFRA] Created: {out_tif}")
+    return out_tif
+
+def build_global_infrastructure(global_tag_rasters, out_path):
     """
-    Wrapper that merges all tag-level rasters into the final infrastructure raster.
+    Merges all global tag rasters into a single infrastructure raster
+    by summing their values.
     """
-
-    if not inputs:
-        print("[MERGE] No rasters to sum.")
-        return
-    print(f"[MERGE] Summing {len(inputs)} rasters into {out_path.name} (multi-threaded) ...")
-    _calc_sum_safe(inputs, out_path)
+    print(f"[MERGE-INFRA] Summing {len(global_tag_rasters)} global tag rasters")
+    merge_rasters_sum(global_tag_rasters, out_path)
+    return out_path
 
 def upload_to_gcs(local_path: Path, gcs_uri: str):
     """
     Uses the 'gsutil' CLI to copy rasters to a GCS bucket.
     """
-
     print(f"[UPLOAD] {local_path.name} → {gcs_uri}")
     gsutil_path = shutil.which("gsutil") or shutil.which("gsutil.cmd") or shutil.which("gsutil.CMD")
     if gsutil_path is None:
@@ -672,7 +767,6 @@ def ensure_ee_folder_exists(folder_path: str):
     """
     Ensure a GEE folder exists before uploading assets into it.
     """
-
     try:
         ee.data.getAsset(folder_path)
         print(f"[EE FOLDER] Exists: {folder_path}")
@@ -685,103 +779,137 @@ def ensure_ee_folder_exists(folder_path: str):
         print(f"[EE FOLDER] Creating: {folder_path}")
         ee.data.createAsset({'type': 'Folder'}, folder_path)
 
-def import_to_earth_engine(asset_id: str, gcs_uri: str):
+def ensure_ee_image_collection(asset_id: str):
     """
-    Given a GCS URI and desired asset ID, tell Earth Engine
-    to ingest the raster as an asset.
-    Uses the GEE REST ingestion API (ee.data.startIngestion).
+    Ensure an Earth Engine ImageCollection for tag images exists.
     """
-
-    print(f"[EE IMPORT] {gcs_uri} → {asset_id}")
     try:
-        folder_path = "/".join(asset_id.split("/")[:-1])
-        ensure_ee_folder_exists(folder_path)
-        try:
-            ee.data.getAsset(asset_id)
-            print(f"[EE IMPORT] Asset already exists: {asset_id} — skipping upload.")
-            return
-        except ee.ee_exception.EEException:
-            pass
-
-        # Extract resolution if encoded in filename (e.g., *_300m.tif)
-        res_match = re.search(r"_(\d{2,4})m", asset_id)
-        res_m = int(res_match.group(1)) if res_match else None
-
-        params = {
-            'id': asset_id,
-            'tilesets': [{'sources': [{'uris': [gcs_uri]}]}],
-            'bands': [{'id': 'b1'}],
-            'pyramidingPolicy': 'MEAN',
-            'properties': {
-                'year': int(re.search(r"/(\d{4})/", asset_id).group(1)) if re.search(r"/(\d{4})/", asset_id) else None,
-                'resolution_m': res_m
-            }
-        }
-        task = ee.data.startIngestion(str(uuid.uuid4()), params)
-        print(f"[EE IMPORT] Ingestion task started: {task['id']}")
-    except Exception as e:
-        print(f"[EE IMPORT ERROR] Failed to import {asset_id}: {e}")
-        raise
+        ee.data.getAsset(asset_id)
+        print(f"[EE COLLECTION] Exists: {asset_id}")
+    except ee.ee_exception.EEException:
+        print(f"[EE COLLECTION] Creating: {asset_id}")
+        ee.data.createAsset({"type": "ImageCollection"}, asset_id)
 
 def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged_only: bool = False):
     """
-    Upload rasters to GCS and GEE.
-    If upload_merged_only=True, uploads only the merged final raster (infrastructure layer).
-    Otherwise, uploads all per-tag rasters plus the merged one.
-    Each uploaded raster is registered as a new GEE asset.
-    The OSM download metadata file is also uploaded to GCS.
+    Uploads rasters to GCS and imports them as Earth Engine assets.
+    - If upload_merged_only=True: uploads only the final infrastructure raster.
+    - Otherwise: uploads all per-tag global rasters plus the infrastructure raster.
+    - Tag rasters: ImageCollection 'tags_{year}_{res_m}m'
+    - Infrastructure raster: in the root year folder
     """
 
     print(f"[EXPORT] Uploading rasters for {year} to GCS and importing to Earth Engine...")
 
     res_m = degrees_to_meters(res)
+    merged_infra = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
 
-    if upload_merged_only:
-        merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
-        if not merged_candidate.exists():
-            print("[EXPORT] Merged raster not found — cannot upload merged-only.")
-            return
-        tifs = [merged_candidate]
-        print(f"[EXPORT] Uploading only merged raster: {merged_candidate.name}")
+    # Target ImageCollection for tag rasters
+    collection_id = f"{EE_ASSET_ROOT}/{year}/tags_{year}_{res_m}m"
+
+    # Ensure collection & folder exists
+    ensure_ee_folder_exists(f"{EE_ASSET_ROOT}/{year}")
+    parent = f"{EE_ASSET_ROOT}/{year}"
+    ensure_ee_folder_exists(parent)
+    ensure_ee_image_collection(collection_id)
+
+    tag_rasters = sorted(raster_dir.glob("*_global*.tif"))
+    if not tag_rasters and not upload_merged_only:
+        print("[WARN] No global tag rasters found — skipping tag uploads.")
+
+    to_upload = []
+    if merged_infra.exists():
+        to_upload.append(merged_infra)
     else:
-        tifs = list(raster_dir.glob("*.tif"))
-        merged_candidate = raster_dir.parent / f"flii_infra_{year}_{res_m}m.tif"
-        if merged_candidate.exists():
-            tifs.append(merged_candidate)
-            print(f"[EXPORT] Including merged raster: {merged_candidate.name}")
+        print("[WARN] Infrastructure raster not found — skipping.")
 
-    if not tifs:
+    if not upload_merged_only:
+        to_upload.extend(tag_rasters)
+
+    if not to_upload:
         print("[EXPORT] No rasters found to export.")
         return
 
+    print(f"[EXPORT] Total rasters to upload: {len(to_upload)}")
+
     exported_assets = []
-    for tif in tifs:
+
+    for tif in to_upload:
+
+        is_infra = tif == merged_infra
+
+        # Tag rasters go into ImageCollection, infra goes to parent folder
+        if is_infra:
+            safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
+            asset_id = f"{EE_ASSET_ROOT}/{year}/{safe_stem}"
+        else:
+            # Each tag raster becomes an individual element inside the ImageCollection
+            safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
+            asset_id = f"{collection_id}/{safe_stem}"
+
         gcs_uri = f"gs://{GCS_BUCKET}/{year}/{tif.name}"
-        safe_stem = re.sub(r"[^A-Za-z0-9_-]", "_", tif.stem)
-        asset_id = f"{EE_ASSET_ROOT}/{year}/{safe_stem}"
 
         try:
+            print(f"[UPLOAD] Uploading {tif.name} → {gcs_uri}")
             upload_to_gcs(tif, gcs_uri)
-            import_to_earth_engine(asset_id, gcs_uri)
+
+            # Determine band structure
+            try:
+                ds = gdal.Open(str(tif))
+                band_count = ds.RasterCount if ds else 1
+                bands = [{"id": f"b{i+1}"} for i in range(band_count)]
+                ds = None
+            except Exception:
+                bands = [{"id": "b1"}]
+
+            print(f"[EE IMPORT] Importing {tif.name} ({len(bands)} band(s)) → {asset_id}")
+
+            ensure_ee_folder_exists("/".join(asset_id.split("/")[:-1]))
+
+            # Skip if asset exists
+            try:
+                ee.data.getAsset(asset_id)
+                print(f"[EE IMPORT] Asset already exists — skipping: {asset_id}")
+                continue
+            except ee.ee_exception.EEException:
+                pass
+
+            # Build ingestion request
+            props = {"year": year, "resolution_m": res_m}
+            params = {
+                "id": asset_id,
+                "tilesets": [{"sources": [{"uris": [gcs_uri]}]}],
+                "bands": bands,
+                "pyramidingPolicy": "MEAN",
+                "properties": props,
+            }
+
+            task = ee.data.startIngestion(str(uuid.uuid4()), params)
+            print(f"[EE IMPORT] Ingestion started: {task['id']}")
+
             exported_assets.append({
                 "filename": tif.name,
                 "asset_id": asset_id,
                 "gcs_uri": gcs_uri,
-                "status": "imported"
-            })
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Failed for {tif.name}: {e}")
-            exported_assets.append({
-                "filename": tif.name,
-                "asset_id": asset_id,
-                "gcs_uri": gcs_uri,
-                "status": f"failed - {e}"
+                "bands": len(bands),
+                "status": "imported",
             })
 
+        except Exception as e:
+            print(f"[ERROR] Failed to upload/import {tif.name}: {e}")
+            exported_assets.append({
+                "filename": tif.name,
+                "asset_id": asset_id,
+                "gcs_uri": gcs_uri,
+                "status": f"failed - {e}",
+            })
+
+    # Save export metadata locally.
     metadata_path = raster_dir / f"gee_export_metadata_{year}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(exported_assets, f, indent=2)
 
+    # Upload metadata to GCS.
     gcs_metadata_uri = f"gs://{GCS_BUCKET}/{year}/gee_export_metadata_{year}.json"
     try:
         subprocess.run(["gsutil", "cp", str(metadata_path), gcs_metadata_uri], check=True)
@@ -789,26 +917,21 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
     except subprocess.CalledProcessError as e:
         print(f"[WARN] Could not upload metadata to GCS: {e}")
 
-    print(f"Export summary saved: {gcs_metadata_uri}")
-
-    # OSM metadata file.
     osm_meta_path = raster_dir.parent / "osm_download_metadata.json"
     if osm_meta_path.exists():
         osm_gcs_uri = f"gs://{GCS_BUCKET}/{year}/osm_download_metadata.json"
         try:
             subprocess.run(["gsutil", "cp", str(osm_meta_path), osm_gcs_uri], check=True)
-            print(f"[METADATA] Uploaded OSM metadata to GCS: {osm_gcs_uri}")
+            print(f"[METADATA] Uploaded OSM metadata: {osm_gcs_uri}")
         except subprocess.CalledProcessError as e:
             print(f"[WARN] Could not upload OSM metadata to GCS: {e}")
-    else:
-        print("[WARN] No OSM metadata file found to upload.")
+
 
 def cleanup_intermediates(year_dir: Path):
     """
     After a successful run, this removes large intermediate files (CSV shards,
     temporary merge rasters, etc.) to save disk space.
     """
-
     print(f"[CLEANUP] Removing intermediates in {year_dir}")
     for sub in ["csvs", "rasters/_tmp_merge"]:
         p = year_dir / sub
@@ -818,7 +941,6 @@ def main():
     """
     Runs all stages from OSM download to Earth Engine export.
     """
-
     # Parse command-line arguments.
     parser = argparse.ArgumentParser(prog="python src/task.py",
         description=(
@@ -829,6 +951,7 @@ def main():
             "and uploads both individual layers and the final raster to Google Earth Engine."
         ),
         formatter_class=argparse.RawTextHelpFormatter)
+    
     parser.add_argument("--year", type=int, default=date.today().year,
         help="Target year for OSM data (e.g., 2024). \n" \
         "Default = current (today's) year.\n" \
@@ -848,6 +971,9 @@ def main():
     parser.add_argument("--max_csv_rows", type=int, default=1_000_000, 
         help="Max rows per tag CSV shard (streaming split). Default: 1_000_000")
     
+    parser.add_argument("--tile", type=int, default=60,
+        help="Tile size in degrees for global tiling (default = 60). Smaller values create more tiles.")
+
     parser.add_argument("--cleanup", action="store_true", 
         help="Remove intermediate CSVs and raster files after successful processing.")
     
@@ -863,7 +989,12 @@ def main():
     do_cleanup = args.cleanup
     upload_merged_only = args.upload_merged_only
     res_m = degrees_to_meters(res)
-    
+    tile_size = args.tile
+    if bounds == (-180, -90, 180, 90):
+        snapped_bounds = bounds
+    else:
+        snapped_bounds = snap_bounds(bounds, res)
+
     # Define paths and names.
     year_dir = OUTPUT_BASE_DIR / f"{year}"
     txt_dir = year_dir
@@ -899,26 +1030,80 @@ def main():
         if not txt_files:
             print("[WARN] No OSM text file found.")
         else:
-            split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
+            existing_csvs = list(csv_dir.glob("*.csv"))
+            if existing_csvs:
+                print(f"[SKIP] Found {len(existing_csvs)} CSV files — skipping text-to-CSV conversion.")
+            else:
+                print("[SPLIT] No CSVs found — generating from text...")
+                split_text_to_csv_streaming(txt_files[0], csv_dir, categories, max_rows=max_rows)
 
-    with log_time("[4] Rasterize CSVs (parallel)"):
+
+    with log_time("[4] Rasterize CSVs by tile (single-band rasters per tag)"):
+
+        tiles = generate_snapped_tiles(snapped_bounds, tile_size)
+
         csv_files = list(csv_dir.glob("*.csv"))
         if not csv_files:
             print("[WARN] No CSV files to rasterize.")
         else:
-            rasters = rasterize_all(csv_files, raster_dir, bounds, res)
+            print(f"[RASTERIZE] Splitting AOI into {len(tiles)} tiles of {tile_size}°×{tile_size}°")
 
-    with log_time("[5] Merge all rasters"):
-        tag_rasters = merge_tag_shards(raster_dir)
-        sum_all_rasters(tag_rasters, merged_path)
+            tile_outputs = []
+            for i, tile_bounds in enumerate(tiles, 1):
+                pass
+                tile_dir = raster_dir / f"tile_{i:03d}"
+                tile_dir.mkdir(parents=True, exist_ok=True)
 
-    with log_time("[6] Initialize Earth Engine + export rasters"):
+                print(f"[TILE {i}/{len(tiles)}] Processing bounds {tile_bounds}")
+
+                try:
+                    # Group CSV shards by tag (strip shard suffix)
+                    tag_groups = defaultdict(list)
+                    for csv_path in csv_files:
+                        tag_base = strip_shard_suffix(csv_path.stem)
+                        tag_groups[tag_base].append(csv_path)
+
+                    # Parallel rasterization (each tag → single-band raster)
+                    num_cpus = max(1, multiprocessing.cpu_count() - 1)
+                    print(f"[RASTERIZE] {len(tag_groups)} unique tags found — using {num_cpus} workers.")
+
+                    with ThreadPoolExecutor(max_workers=num_cpus) as exe:
+                        futures = [
+                            exe.submit(_rasterize_tag, t, g, tile_dir, tile_bounds, res)
+                            for t, g in tag_groups.items()
+                        ]
+                        for j, f in enumerate(as_completed(futures), 1):
+                            try:
+                                f.result()
+                            except Exception as e:
+                                print(f"[TILE {i}] Tag rasterization failed: {e}")
+                            if j % 10 == 0 or j == len(futures):
+                                print(f"[TILE {i}] {j}/{len(futures)} tags rasterized.")
+
+                except Exception as e:
+                    print(f"[TILE {i}] Failed: {e}")
+                    continue
+
+            print(f"[RASTERIZE] Completed {len(tile_outputs)}/{len(tiles)} tiles.")
+
+    # Merge per-tile infrastructure rasters into global infra layer
+    with log_time("[5] Global tag rasters merge"):
+        global_tag_rasters = build_global_tag_rasters(
+            raster_dir, raster_dir, year, res, res_m, snapped_bounds
+        )
+
+    infra_path = year_dir / f"flii_infra_{year}_{res_m}m.tif"
+
+    with log_time("[6] Global infrastructure merge"):
+        build_global_infrastructure(global_tag_rasters, infra_path)
+
+    with log_time("[7] Initialize Earth Engine + export rasters"):
         init_google_earth_engine()
         export_rasters_to_gee(raster_dir, year, res, upload_merged_only)
 
     # Optionally clean up intermediates.
     if do_cleanup:
-        with log_time("[7] Cleanup intermediates"):
+        with log_time("[8] Cleanup intermediates"):
             cleanup_intermediates(year_dir)
 
 if __name__ == "__main__":
