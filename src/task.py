@@ -68,7 +68,6 @@ def log_time(label: str):
     It prints the elapsed time when the block ends.
     Used in the 'main' function.
     """
-    
     start = time.time()
     print(f"[TIMER] Starting: {label}")
     try:
@@ -82,7 +81,6 @@ def degrees_to_meters(res_deg: float) -> int:
     Approximate degrees to meters conversion at the equator.
     Used to append resolution suffixes like '_300m' to raster filenames.
     """
-
     meters = res_deg * 111_320
     return int(math.ceil(meters / 10.0) * 10)
 
@@ -90,7 +88,6 @@ def activate_gcloud_service_account():
     """
     Activates the gcloud service account using the provided key file or inlined JSON. 
     """
-
     print(f"[GCP AUTH] Activating service account for gcloud: {SERVICE_ACCOUNT}")
 
     # Find gcloud in PATH.
@@ -133,7 +130,6 @@ def init_google_earth_engine():
     Initializes the Earth Engine API.
     Sets cloud project.
     """
-
     activate_gcloud_service_account()
     print(f"[AUTH] Authenticating with service account: {SERVICE_ACCOUNT}")
 
@@ -162,7 +158,6 @@ def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]
     For example, if task_year=2024, it searches around 2023-12-31.
     It checks multiple known mirror URLs.
     """
-
     taskdate = datetime(task_year - 1, 12, 31)
 
     def _try_osm_urls(urlbase: str, maxage: int) -> Optional[Tuple[str, str]]:
@@ -220,7 +215,6 @@ def download_pbf(year: int, dest_path: Path) -> Path:
     Supports resuming partial downloads if the server allows it.
     Stores metadata (size, URL, date) about the download in a JSON file alongside the data.
     """
-
     metadata_path = dest_path.parent / "osm_download_metadata.json"
     url, found_date = _find_osm_pbf_url(year)
     print(f"[DOWNLOAD] Preparing to fetch {url}")
@@ -297,11 +291,8 @@ def download_pbf(year: int, dest_path: Path) -> Path:
 
 def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
     """
-    Convert an OSM PBF/BZ2 file directly to text using osmium export.
-    Optimized for global runs: filters by relevant keys only, no intermediate PBF.
-    Compatible with Osmium versions that expect JSON configs.
+    Converts an OSM PBF/BZ2 file to text using osmium export.
     """
-    
     if not osm_path.exists():
         raise FileNotFoundError(f"[ERROR] OSM input file not found: {osm_path}")
 
@@ -331,15 +322,15 @@ def osmium_to_text(osm_path: Path, txt_dir: Path, config: Dict) -> Path:
         str(osm_path)
     ]
 
-    # Use stdbuf for unbuffered output if available
+    # Use stdbuf for unbuffered output if available.
     if shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
 
-    # Force progress even in non-TTY Docker environments
+    # Force progress even in non-TTY Docker environments.
     env = os.environ.copy()
     env["OSMIUM_SHOW_PROGRESS"] = "1"
 
-    # Run and stream live progress (handles both \r and \n)
+    # Run and stream live progress.
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -380,7 +371,6 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
     This allows flexible per-tag rasterization later.
     Shards are named like highway_residential_001.csv, highway_residential_002.csv, etc.
     """
-    
     os.makedirs(csv_dir, exist_ok=True)
     txt_file = Path(txt_file)
     csv_dir = Path(csv_dir)
@@ -472,7 +462,7 @@ def strip_shard_suffix(name):
 
 def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
     """
-    Generate a list of (xmin, ymin, xmax, ymax) tiles covering the global extent.
+    Generate a list of (xmin, ymin, xmax, ymax) tiles covering the extent.
     The 'step' defines the tile size in degrees.
     Each tile will be aligned on whole degree boundaries for consistency.
     """
@@ -514,11 +504,10 @@ def generate_snapped_tiles(bounds, tile_deg):
 
 def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
     """
-    Rasterize all CSV shards belonging to a single tag into individual TIFFs
-    inside this tile directory.
+    Rasterizes all CSV shards into individual TIFFs
+    inside each tile directory.
     """
-
-    safe_tag = re.sub(r"[=:/@]", "_", tag)
+    
     tile_dir = Path(tile_dir)
     tile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -557,7 +546,6 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
                 str(shard_tif)
             ]
 
-            # Run GDAL
             subprocess.run(cmd, check=True)
 
         shard_rasters.append(shard_tif)
@@ -566,13 +554,8 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
 
 def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_transform):
     """
-    Mosaic many tile rasters of the same tag into a single global raster.
-
-    - Each tile is already on the same grid (same resolution / CRS).
-    - Tiles are placed into the correct global window based on their transform.
-    - Overlaps (if any) are summed; non-overlapping tiles just fill their own area.
+    Mosaics many tile rasters of the same tag into a single global raster.
     """
-
     if not tile_tifs:
         raise ValueError("No rasters provided for mosaic.")
 
@@ -593,7 +576,7 @@ def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_tra
         tiled=True,
     )
 
-    # 1) Create the (empty) global dataset
+    # 1) Create the (empty) tif
     with rasterio.open(out_tif, "w", **profile):
         pass  # just create; data will default to 0
 
@@ -607,7 +590,7 @@ def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_tra
                 left, bottom, right, top = src.bounds
                 tile_h, tile_w = src.height, src.width
 
-                # Upper-left pixel in the global grid
+                # Upper-left pixel in the grid
                 row_ul, col_ul = rasterio.transform.rowcol(global_transform, left, top)
 
                 # Choose block size (use source blocks if available)
@@ -621,11 +604,11 @@ def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_tra
                         h = min(block_h, tile_h - r_off)
                         w = min(block_w, tile_w - c_off)
 
-                        # Corresponding position in global grid
+                        # Corresponding position in grid
                         global_row = row_ul + r_off
                         global_col = col_ul + c_off
 
-                        # Clip to global bounds (important when tiles extend beyond AOI)
+                        # Clip to bounds (important when tiles extend beyond AOI)
                         if global_row >= global_height or global_col >= global_width:
                             continue
 
@@ -647,25 +630,23 @@ def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_tra
 
 def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, bounds):
     """
-    Build one global raster per tag by mosaicking all tile rasters of that tag.
-
+    Builds one global raster per tag by mosaicking all tile rasters of that tag.
     - Global grid is defined by the (snapped) input bounds + resolution.
     - For each tag, we find all per-tile TIFFs matching that tag and mosaic them.
     """
-
     raster_dir = Path(raster_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
 
-    # Global grid = snapped user bounds (option A you chose)
+    # Global grid = snapped user bounds.
     xmin, ymin, xmax, ymax = snap_bounds(bounds, res_deg)
     global_width = int(round((xmax - xmin) / res_deg))
     global_height = int(round((ymax - ymin) / res_deg))
 
-    # Note: from_origin(xmin, ymax, x_res, y_res)
+    # Note: from_origin(xmin, ymax, x_res, y_res).
     global_transform = rasterio.transform.from_origin(xmin, ymax, res_deg, res_deg)
 
-    # Discover tags from the first tile dir
+    # Discover tags from the first tile dir.
     first_tile = next(raster_dir.glob("tile_*"))
     tags = sorted({
         strip_shard_suffix(tif.stem)
@@ -675,9 +656,9 @@ def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, bounds):
     global_tag_paths = []
 
     for tag in tags:
-        print(f"[MERGE-TAG] {tag}")
+        print(f"[MOSAIC-TAG] {tag}")
 
-        # find all shards across all tiles (only inside tile_* directories)
+        # find all shards across all tiles (only inside tile_* directories).
         tile_tifs = []
         for tile_dir in sorted(raster_dir.glob("tile_*")):
             tile_tifs.extend(sorted(tile_dir.glob(f"{tag}_*.tif")))
@@ -699,11 +680,7 @@ def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, bounds):
 
 def merge_rasters_sum(input_tifs, out_tif, profile_override=None):
     """
-    Extremely fast global merge: sum 100+ rasters blockwise using numpy.memmap.
-
-    - input_tifs: list of TIFF paths (all on the same grid)
-    - out_tif: output GeoTIFF path
-    - profile_override: optional rasterio profile overrides
+    Sums 100+ rasters blockwise using numpy.memmap.
     - Uses 1024x1024 read chunks for high IO efficiency.
     """
 
@@ -761,18 +738,19 @@ def merge_rasters_sum(input_tifs, out_tif, profile_override=None):
     print(f"[MERGE-INFRA] Created: {out_tif}")
     return out_tif
 
-
 def build_global_infrastructure(global_tag_rasters, out_path):
+    """
+    Merges all global tag rasters into a single infrastructure raster
+    by summing their values.
+    """
     print(f"[MERGE-INFRA] Summing {len(global_tag_rasters)} global tag rasters")
     merge_rasters_sum(global_tag_rasters, out_path)
     return out_path
-
 
 def upload_to_gcs(local_path: Path, gcs_uri: str):
     """
     Uses the 'gsutil' CLI to copy rasters to a GCS bucket.
     """
-
     print(f"[UPLOAD] {local_path.name} → {gcs_uri}")
     gsutil_path = shutil.which("gsutil") or shutil.which("gsutil.cmd") or shutil.which("gsutil.CMD")
     if gsutil_path is None:
@@ -789,7 +767,6 @@ def ensure_ee_folder_exists(folder_path: str):
     """
     Ensure a GEE folder exists before uploading assets into it.
     """
-
     try:
         ee.data.getAsset(folder_path)
         print(f"[EE FOLDER] Exists: {folder_path}")
@@ -805,7 +782,6 @@ def ensure_ee_folder_exists(folder_path: str):
 def ensure_ee_image_collection(asset_id: str):
     """
     Ensure an Earth Engine ImageCollection for tag images exists.
-    If not, create it.
     """
     try:
         ee.data.getAsset(asset_id)
@@ -928,10 +904,12 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
                 "status": f"failed - {e}",
             })
 
+    # Save export metadata locally.
     metadata_path = raster_dir / f"gee_export_metadata_{year}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(exported_assets, f, indent=2)
 
+    # Upload metadata to GCS.
     gcs_metadata_uri = f"gs://{GCS_BUCKET}/{year}/gee_export_metadata_{year}.json"
     try:
         subprocess.run(["gsutil", "cp", str(metadata_path), gcs_metadata_uri], check=True)
@@ -954,7 +932,6 @@ def cleanup_intermediates(year_dir: Path):
     After a successful run, this removes large intermediate files (CSV shards,
     temporary merge rasters, etc.) to save disk space.
     """
-
     print(f"[CLEANUP] Removing intermediates in {year_dir}")
     for sub in ["csvs", "rasters/_tmp_merge"]:
         p = year_dir / sub
@@ -964,7 +941,6 @@ def main():
     """
     Runs all stages from OSM download to Earth Engine export.
     """
-
     # Parse command-line arguments.
     parser = argparse.ArgumentParser(prog="python src/task.py",
         description=(
@@ -975,6 +951,7 @@ def main():
             "and uploads both individual layers and the final raster to Google Earth Engine."
         ),
         formatter_class=argparse.RawTextHelpFormatter)
+    
     parser.add_argument("--year", type=int, default=date.today().year,
         help="Target year for OSM data (e.g., 2024). \n" \
         "Default = current (today's) year.\n" \

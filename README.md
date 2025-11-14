@@ -21,19 +21,19 @@ It is recommended to run the FLII OSM pipeline inside a Docker container to ensu
 
 3. **Split text into filtered CSVs with tag-specific weights**  
    - Extracts features (e.g. lines, points) matching the OSM tags and subcategories defined in [`osm_config.json`](osm_config.json).  
-   - Writes one CSV per tag-value combination (e.g., `highway=footway.csv`) with the geographic WKT information, and subcategory-specific weights defined in `osm_config.json`.
+   - Writes one or more CSVs per tag-value combination (e.g., `highway_footway_001.csv`, `highway_footway_002.csv`) with the geographic WKT information, and subcategory-specific weights defined in `osm_config.json`.
 
 4. **Rasterize each CSV file**  
-   Converts each CSV into a GeoTIFF using `gdal_rasterize` (e.g., `highway_footway.tif`).
+   Converts each CSV into a GeoTIFF using `gdal_rasterize` (e.g., `highway_footway_001.tif`, `highway_footway_002.tif`). This process is done by tiles.
 
-5. **Merge rasters into a final infrastructure layer**  
-   Merges rasters into one weighted raster representing the final infrastructure layer.
+5. **Mosaics rasters into global layers and sums them into the final infrastructure layer**  
+   Mosaics tiled rasters into global tag-specific layers and then calculates one weighted raster representing the final infrastructure layer.
 
 6. **Export results to Google Cloud Storage (GCS)**  
    Uploads each GeoTIFF (and metadata) to the configured GCS bucket.
 
 7. **Import to Google Earth Engine (EE)**  
-   Publishes each raster as an EE asset.
+   Publishes each raster as an EE asset. The code creates a `<year>` folder to allocate the rasters. The infrastructure layer is uploaded as an image and the tag rasters as images inside an `ImageCollection` called `tags_<year>_<res_m>m`.
 
 ---
 
@@ -58,10 +58,15 @@ task_flii_osm/
 │     ├── 2023/
 │     └── 2024/
 │           ├── csvs/
-│           │     └── <category=subcategory>.csv
+│           │     ├── <category_subcategory>_001.csv
+|           |     └── <category_subcategory>_002.csv
 │           ├── rasters/
-│           │     ├── gee_export_metadata_2024.json
-│           │     └── <category_subcategory>.tiff
+│           │     ├── tile_001/
+|           |     |     ├── <category_subcategory>_001.tif
+|           |     |     └── <category_subcategory>_002.tif
+|           |     ├── tile_002/
+|           |     ├── <category_subcategory>_global_2024_300m.tif
+│           │     └── gee_export_metadata_2024.json
 │           ├── flii_infra_2024_300m.tif
 │           ├── osm_2024.osm.pbf
 │           ├── osm_2024.txt
@@ -106,17 +111,17 @@ By default, the code runs for the year to date, outputs `0.00269 degrees` resolu
 To run the task:
 
 ```
-python src/task.py --upload_merged_only
+python src/task.py
 ```
 
 If running for a specific year (not the current year), set the  `--year` flag:
 ```
-python src/task.py --year 2024 --upload_merged_only
+python src/task.py --year 2024
 ```
 
-If you want to upload all tag-level rasters (e.g. highway_primary.tif, power_plant.tif, etc) to Cloud Storage and as an GEE asset, remove the    `--upload_merged_only` flag (more cloud/GEE storage space needed).
+If you want to upload only the final infrastructure layer to Cloud Storage and as an GEE asset, add the    `--upload_merged_only` flag.
 ```
-python src/task.py --year 2024
+python src/task.py --year 2024 --upload_merged_only
 ```
 
 If you want to change the raster resolution, change `--resolution` flag. E.g. 100 m (near the Equator). Always in EPSG:4326:
@@ -124,10 +129,22 @@ If you want to change the raster resolution, change `--resolution` flag. E.g. 10
 python src/task.py --year 2024 --resolution 0.0009 --upload_merged_only
 ```
 
+Note: For resolutions lower than 300 m (0.00269), you might need to change the `--tile` flag to avoid tiles with too many pixels (e.g, `--tile 30`).
+
 If you want to clean up intermediate files from the container/VM right away (e.g. CSV files, temporary merge rasters, etc), you can use the `--cleanup` flag.
 ```
 python src/task.py --year 2024 --cleanup
 ```
+
+Summary of flags:
+| Flag                           | Description                                   |
+| ------------------------------ | --------------------------------------------- |
+| `--tile`                       | Tile size in degrees (default 60)             |
+| `--bounds xmin ymin xmax ymax` | Rasterization extent (default -180 -90 180 90)|
+| `--resolution`                 | Pixel size in degrees (default 0.00269)       |
+| `--upload_merged_only`         | Upload only final infra raster                |
+| `--max_csv_rows`               | Limit for shard splitting (default 1,000,000) |
+| `--cleanup`                    | Delete CSVs and temp rasters after export     |
 
 ## License
 Copyright (C) 2025 Wildlife Conservation Society.
