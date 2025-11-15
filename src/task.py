@@ -535,7 +535,7 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
                 "-a_srs", "EPSG:4326",
                 "-ot", "Byte",
                 "-tr", str(res), str(res),
-                "-te", str(xmin), str(ymin), str(xmin + px_w * res), str(ymin + px_h * res),
+                "-te", str(xmin), str(ymin), str(xmax), str(ymax),
                 "-init", "0",
                 "-co", "TILED=YES",
                 "-co", "BLOCKXSIZE=256",
