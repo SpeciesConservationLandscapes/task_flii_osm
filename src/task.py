@@ -483,23 +483,64 @@ def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
     return tiles
 
 def snap_bounds(bounds, res):
+    """
+    Snap bounds to a global pixel grid whose origin is (-180, -90),
+    with pixel size = res (degrees).
+    Ensures perfect alignment for global & regional AOIs.
+    """
     xmin, ymin, xmax, ymax = bounds
-    xmin = math.floor(xmin / res) * res
-    ymin = math.floor(ymin / res) * res
-    xmax = math.ceil(xmax / res) * res
-    ymax = math.ceil(ymax / res) * res
-    return xmin, ymin, xmax, ymax
 
-def generate_snapped_tiles(bounds, tile_deg):
-    xmin, ymin, xmax, ymax = bounds
+    # Convert to pixel indices relative to global origin (-180, -90)
+    col_min = round((xmin + 180.0) / res)
+    col_max = round((xmax + 180.0) / res)
+    row_min = round((ymin + 90.0) / res)
+    row_max = round((ymax + 90.0) / res)
+
+    # Convert back to geographic
+    xmin_s = col_min * res - 180.0
+    xmax_s = col_max * res - 180.0
+    ymin_s = row_min * res - 90.0
+    ymax_s = row_max * res - 90.0
+
+    # Pretty rounding for logs
+    xmin_s = round(xmin_s, 8)
+    ymin_s = round(ymin_s, 8)
+    xmax_s = round(xmax_s, 8)
+    ymax_s = round(ymax_s, 8)
+
+    return (xmin_s, ymin_s, xmax_s, ymax_s)
+
+def generate_pixel_aligned_tiles(snapped_bounds, res, max_tile_size_deg):
+    """
+    Generate tiles aligned in pixel space, ensuring that every tile boundary
+    lies exactly on the global grid.
+    """
+    xmin, ymin, xmax, ymax = snapped_bounds
+
+    # Number of pixels across AOI
+    global_px_w = int(round((xmax - xmin) / res))
+    global_px_h = int(round((ymax - ymin) / res))
+
+    # Convert tile size in degrees → pixels
+    tile_px = int(round(max_tile_size_deg / res))
+
     tiles = []
-    x = xmin
-    while x < xmax:
-        y = ymin
-        while y < ymax:
-            tiles.append((x, y, x + tile_deg, y + tile_deg))
-            y += tile_deg
-        x += tile_deg
+
+    # Loop over rows/cols in pixel space
+    for row0 in range(0, global_px_h, tile_px):
+        for col0 in range(0, global_px_w, tile_px):
+
+            row1 = min(row0 + tile_px, global_px_h)
+            col1 = min(col0 + tile_px, global_px_w)
+
+            # Convert pixel positions back to geographic coordinates
+            x0 = xmin + col0 * res
+            x1 = xmin + col1 * res
+            y1 = ymax - row0 * res
+            y0 = ymax - row1 * res
+
+            tiles.append((x0, y0, x1, y1))
+
     return tiles
 
 def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
@@ -809,9 +850,8 @@ def export_rasters_to_gee(raster_dir: Path, year: int, res: float, upload_merged
 
     # Ensure collection & folder exists
     ensure_ee_folder_exists(f"{EE_ASSET_ROOT}/{year}")
-    parent = f"{EE_ASSET_ROOT}/{year}"
-    ensure_ee_folder_exists(parent)
-    ensure_ee_image_collection(collection_id)
+    if not upload_merged_only:
+        ensure_ee_image_collection(collection_id)
 
     tag_rasters = sorted(raster_dir.glob("*_global*.tif"))
     if not tag_rasters and not upload_merged_only:
@@ -1040,7 +1080,7 @@ def main():
 
     with log_time("[4] Rasterize CSVs by tile (single-band rasters per tag)"):
 
-        tiles = generate_snapped_tiles(snapped_bounds, tile_size)
+        tiles = generate_pixel_aligned_tiles(snapped_bounds, res, tile_size)
 
         csv_files = list(csv_dir.glob("*.csv"))
         if not csv_files:
