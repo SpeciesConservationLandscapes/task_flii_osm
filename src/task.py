@@ -1119,7 +1119,8 @@ def main():
                                 print(f"[TILE {i}] Tag rasterization failed: {e}")
                             if j % 10 == 0 or j == len(futures):
                                 print(f"[TILE {i}] {j}/{len(futures)} tags rasterized.")
-
+                    tile_outputs.append(tile_dir)
+                    
                 except Exception as e:
                     print(f"[TILE {i}] Failed: {e}")
                     continue
