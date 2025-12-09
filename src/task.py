@@ -36,7 +36,9 @@ gdal.SetConfigOption("GDAL_CACHEMAX", "4096")
 gdal.SetConfigOption("GDAL_SWATH_SIZE", "1048576")  
 gdal.SetConfigOption("GDAL_MAX_DATASET_POOL_SIZE", "400")
 os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
-os.environ["VSI_CACHE"] = "FALSE" 
+os.environ["VSI_CACHE"] = "FALSE"
+REF_XMIN = -180.000823370733258
+REF_YMIN = -88.000761862916562 
 
 # ----------------------
 # DIRECTORY / OSM CONFIG
@@ -82,7 +84,7 @@ def degrees_to_meters(res_deg: float) -> int:
     Used to append resolution suffixes like '_300m' to raster filenames.
     """
     meters = res_deg * 111_320
-    return int(math.ceil(meters / 10.0) * 10)
+    return int(round(meters / 10.0) * 10)
 
 def activate_gcloud_service_account():
     """
@@ -158,7 +160,7 @@ def _find_osm_pbf_url(task_year: int, max_age_days: int = 60) -> Tuple[str, str]
     For example, if task_year=2024, it searches around 2023-12-31.
     It checks multiple known mirror URLs.
     """
-    taskdate = datetime(task_year - 1, 12, 31)
+    taskdate = datetime(task_year, 12, 31)
 
     def _try_osm_urls(urlbase: str, maxage: int) -> Optional[Tuple[str, str]]:
         """
@@ -460,53 +462,23 @@ def split_text_to_csv_streaming(txt_file: Union[str, Path], csv_dir: Union[str, 
 def strip_shard_suffix(name):
     return re.sub(r"(_[0-9]{3})+$", "", name)
 
-def generate_global_tiles(bounds=(-180, -90, 180, 90), step=60):
+def snap_bounds(bounds, res, origin_x=REF_XMIN, origin_y=REF_YMIN):
     """
-    Generate a list of (xmin, ymin, xmax, ymax) tiles covering the extent.
-    The 'step' defines the tile size in degrees.
-    Each tile will be aligned on whole degree boundaries for consistency.
-    """
-    xmin, ymin, xmax, ymax = bounds
-    tiles = []
-    x = xmin
-    while x < xmax:
-        y = ymin
-        while y < ymax:
-            tiles.append((
-                x,
-                y,
-                min(x + step, xmax),
-                min(y + step, ymax)
-            ))
-            y += step
-        x += step
-    return tiles
-
-def snap_bounds(bounds, res):
-    """
-    Snap bounds to a global pixel grid whose origin is (-180, -90),
-    with pixel size = res (degrees).
-    Ensures perfect alignment for global & regional AOIs.
+    Snap bounds to a global pixel grid whose origin is (origin_x, origin_y)
+    with pixel size = res.
     """
     xmin, ymin, xmax, ymax = bounds
 
-    # Convert to pixel indices relative to global origin (-180, -90)
-    col_min = round((xmin + 180.0) / res)
-    col_max = round((xmax + 180.0) / res)
-    row_min = round((ymin + 90.0) / res)
-    row_max = round((ymax + 90.0) / res)
+    # pixel indices relative to legacy origin
+    col_min = math.floor((xmin - origin_x) / res)
+    col_max = math.ceil ((xmax - origin_x) / res)
+    row_min = math.floor((ymin - origin_y) / res)
+    row_max = math.ceil ((ymax - origin_y) / res)
 
-    # Convert back to geographic
-    xmin_s = col_min * res - 180.0
-    xmax_s = col_max * res - 180.0
-    ymin_s = row_min * res - 90.0
-    ymax_s = row_max * res - 90.0
-
-    # Pretty rounding for logs
-    xmin_s = round(xmin_s, 8)
-    ymin_s = round(ymin_s, 8)
-    xmax_s = round(xmax_s, 8)
-    ymax_s = round(ymax_s, 8)
+    xmin_s = origin_x + col_min * res
+    xmax_s = origin_x + col_max * res
+    ymin_s = origin_y + row_min * res
+    ymax_s = origin_y + row_max * res
 
     return (xmin_s, ymin_s, xmax_s, ymax_s)
 
@@ -548,7 +520,6 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
     Rasterizes all CSV shards into individual TIFFs
     inside each tile directory.
     """
-    
     tile_dir = Path(tile_dir)
     tile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -577,6 +548,7 @@ def _rasterize_tag(tag, csv_group, tile_dir, tile_bounds, res):
                 "-ot", "Byte",
                 "-tr", str(res), str(res),
                 "-te", str(xmin), str(ymin), str(xmax), str(ymax),
+                "-at",
                 "-init", "0",
                 "-co", "TILED=YES",
                 "-co", "BLOCKXSIZE=256",
@@ -669,10 +641,9 @@ def mosaic_tiles_sum(tile_tifs, out_tif, global_width, global_height, global_tra
                         combined = np.maximum(existing, data)
                         dst.write(combined, 1, window=dst_window)
 
-def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, bounds):
+def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, snapped_bounds):
     """
     Builds one global raster per tag by mosaicking all tile rasters of that tag.
-    - Global grid is defined by the (snapped) input bounds + resolution.
     - For each tag, we find all per-tile TIFFs matching that tag and mosaic them.
     """
     raster_dir = Path(raster_dir)
@@ -680,7 +651,7 @@ def build_global_tag_rasters(raster_dir, out_dir, year, res_deg, res_m, bounds):
     out_dir.mkdir(exist_ok=True, parents=True)
 
     # Global grid = snapped user bounds.
-    xmin, ymin, xmax, ymax = snap_bounds(bounds, res_deg)
+    xmin, ymin, xmax, ymax = snapped_bounds
     global_width = int(round((xmax - xmin) / res_deg))
     global_height = int(round((ymax - ymin) / res_deg))
 
@@ -995,17 +966,17 @@ def main():
     parser.add_argument("--year", type=int, default=date.today().year,
         help="Target year for OSM data (e.g., 2024). \n" \
         "Default = current (today's) year.\n" \
-        "Uses previous year's planet snapshot (looks for a file from/closest to 12/31/year-1).")
+        "Uses year's planet snapshot (looks for a file from/closest to 12/31/year).")
     
-    parser.add_argument("--resolution", type=float, default=0.00269,
-        help="Output raster resolution in degrees (default = 0.00269 ≈ 300m at the equator).")
+    parser.add_argument("--resolution", type=float, default=0.0026949458523585646,
+        help="Output raster resolution in degrees (default = 0.0026949458523585646 ≈ 300m at the equator).")
     
     parser.add_argument("--bounds", nargs=4, type=float, metavar=("xmin", "ymin", "xmax", "ymax"),
-                        default=[-180, -90, 180, 90],
+                        default=[-180.000823370733258, -88.000761862916562, 180.000823370733258, 88.000761862916562],
         help=(
             "Geographic bounds for rasterization in EPSG:4326.\n"
             "Format: xmin ymin xmax ymax.\n"
-            "Default: global (-180 -90 180 90).\n"
+            "Default: global (-180.000823370733258 -88.000761862916562 180.000823370733258 88.000761862916562).\n"
             "Example: --bounds -10 -56 -35 5"
         ))
     parser.add_argument("--max_csv_rows", type=int, default=1_000_000, 
@@ -1030,17 +1001,13 @@ def main():
     upload_merged_only = args.upload_merged_only
     res_m = degrees_to_meters(res)
     tile_size = args.tile
-    if bounds == (-180, -90, 180, 90):
-        snapped_bounds = bounds
-    else:
-        snapped_bounds = snap_bounds(bounds, res)
+    snapped_bounds = snap_bounds(bounds, res)
 
     # Define paths and names.
     year_dir = OUTPUT_BASE_DIR / f"{year}"
     txt_dir = year_dir
     csv_dir = year_dir / "csvs"
     raster_dir = year_dir / "rasters"
-    merged_path = year_dir / f"flii_infra_{year}_{res_m}m.tif"
     pbf_path = year_dir / f"osm_{year}.osm.pbf"
 
     for d in [csv_dir, raster_dir]:
